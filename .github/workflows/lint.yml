@@ -1,0 +1,29 @@
+name: Verificação
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  sintaxe:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        php: ['8.2', '8.3', '8.4']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ matrix.php }}
+          coverage: none
+      - name: Sintaxe PHP
+        run: |
+          status=0
+          for f in $(git ls-files '*.php'); do
+            php -l "$f" > /dev/null || { echo "Erro de sintaxe em $f"; status=1; }
+          done
+          exit $status
+      - name: Sintaxe JavaScript
+        run: |
+          for f in $(git ls-files 'public/js/*.js'); do node --check "$f" || exit 1; done
