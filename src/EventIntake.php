@@ -48,13 +48,11 @@ class EventIntake
             }
             $host = trim((string) ($p['host'] ?? $p['hostname'] ?? ''));
             $message = trim((string) ($p['message'] ?? $p['description'] ?? ''));
-            $system = mb_substr(trim((string) ($p['source'] ?? 'webhook')), 0, 40);
+            $source = trim((string) ($p['source'] ?? 'webhook'));
+            $system = mb_substr($source, 0, 40);
             $severity = self::severity($p['severity'] ?? 3);
             $recovery = self::isRecovery($p);
-            $key = trim((string) ($p['dedup_key'] ?? ''));
-            if ($key === '') {
-                $key = 'evt:' . sha1($system . '|' . ($p['trigger_id'] ?? $title) . '|' . $host);
-            }
+            $key = IntegrationKey::webhook(trim((string) ($p['dedup_key'] ?? '')), $source, (string) ($p['trigger_id'] ?? $title), $host);
 
             if ($recovery) {
                 foreach (self::openByKey($key) as $e) {

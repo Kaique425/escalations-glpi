@@ -128,8 +128,11 @@ class ItemWatcher
             return 0;
         }
         foreach ($DB->request(['FROM' => Api::TRACKED, 'WHERE' => ['status' => 'active'], 'LIMIT' => 1000]) as $t) {
-            $k = $t['plugin_key'] . '|' . $t['type_key'] . '|' . $t['severity'] . '|' . $t['entities_id'];
-            $cache[$k] ??= Policy::match('plugin', (int) $t['severity'], (int) $t['entities_id'], 0, (string) $t['title'], $t['plugin_key'], $t['type_key']);
+            $criteria = ['plugin', (int) $t['severity'], (int) $t['entities_id'], 0, (string) $t['title'], $t['plugin_key'], $t['type_key']];
+            $k = serialize($criteria);
+            if (!array_key_exists($k, $cache)) {
+                $cache[$k] = Policy::match(...$criteria);
+            }
             $rule = $cache[$k];
             if (!$rule) {
                 continue;
@@ -149,7 +152,7 @@ class ItemWatcher
                 $why = (time() >= $due ? 'O prazo estourou há ' . Ui::dur(time() - $due) . '.' : 'Já consumiu ' . round($pct) . '% do prazo; restam ' . Ui::dur($due - time()) . '.') . ($t['summary'] ? "\n" . $t['summary'] : '');
                 [$id] = Escalation::open([
                     'policies_id' => (int) $rule['policies_id'], 'rules_id' => (int) $rule['id'], 'source' => 'plugin', 'source_ref' => mb_substr($t['plugin_key'] . ':' . $t['type_key'] . ':' . $t['ref_key'], 0, 100),
-                    'dedup_key' => Api::dedup($t['plugin_key'], $t['type_key'], $t['ref_key']), 'title' => $t['title'], 'summary' => $why, 'severity' => (int) $t['severity'], 'entities_id' => (int) $t['entities_id'], 'facts' => $facts, 'actor' => 'plugin',
+                    'dedup_key' => Api::trackedDedup($t['plugin_key'], $t['type_key'], $t['ref_key']), 'title' => $t['title'], 'summary' => $why, 'severity' => (int) $t['severity'], 'entities_id' => (int) $t['entities_id'], 'facts' => $facts, 'actor' => 'plugin',
                 ]);
                 $DB->update(Api::TRACKED, ['status' => 'opened', 'escalations_id' => $id, 'date_mod' => date('Y-m-d H:i:s')], ['id' => $t['id']]);
                 $n++;

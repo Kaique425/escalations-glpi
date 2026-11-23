@@ -53,6 +53,14 @@ if (class_exists(Api::class) && Api::available()) {
 
 Os tipos usados aparecem sozinhos em Hierarquias → Regras (origem "Item de plugin"); o administrador liga cada tipo a uma hierarquia e define severidade mínima e % do prazo. Sem regra, nada é escalado (o log registra o aviso uma vez por dia). Quem chama é responsável por `resolve` quando o item deixa de estar crítico.
 
+### Compatibilidade das chaves
+
+Use a mesma referência completa em `track`, `escalate` e `resolve`. No webhook, envie a mesma `dedup_key` na abertura e na recuperação, ou repita `source`, `trigger_id` e `host` quando a chave for gerada. Sem `trigger_id`, o título faz parte da chave gerada. Campos de texto usados como chave continuam aceitando espaços nas pontas conforme a normalização da integração.
+
+Chaves que cabem no formato histórico continuam válidas. Para entradas longas ou composições com delimitadores ambíguos, o plugin usa uma representação com hash e reserva o prefixo `~1:` para uso interno. Essas identidades exigem a mesma grafia da entrada normalizada, incluindo maiúsculas e acentos nas referências. No catálogo de regras, nomes de plugin acima de 40 caracteres ganham uma chave própria. Tipos acima de 60 caracteres continuam roteados pelo prefixo de 60, e a identidade de cada item inclui o tipo completo.
+
+Os identificadores já gravados permanecem intactos. A API pode localizar uma ocorrência histórica por um vínculo único já registrado no acompanhamento. Um prefixo que perdeu caracteres em versões anteriores não prova qual item o originou. Para recuperar um evento legado desse tipo, envie o `dedup_key` histórico exato, se conhecido e fora do prefixo reservado. Se o identificador não puder ser confirmado ou se vários itens já tiverem sido agrupados sob a mesma chave, identifique a ocorrência pelo rastreio e use a ficha para resolvê-la.
+
 ## Instalar
 
 Requisitos: GLPI 11.0 a 12.0.x e PHP 8.2 ou superior.

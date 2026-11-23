@@ -220,20 +220,24 @@ class Escalation extends Base
     /**
      * Abre um escalonamento (ou agrupa na abertura que já existe com a mesma dedup_key).
      * $in: policies_id, rules_id, source, source_ref, items_id, dedup_key, title, summary, severity, entities_id, facts[], actor.
+     * @param array{id: int, source: string, dedup_key: string}|null $legacy vínculo de acompanhamento da API já existente
      * Devolve [id, criado?].
      */
-    public static function open(array $in): array
+    public static function open(array $in, ?array $legacy = null): array
     {
         $policy = Policy::get((int) $in['policies_id']);
         if (!$policy) {
             throw new RuntimeException('Hierarquia não encontrada.', 404);
         }
-        $key = mb_substr((string) ($in['dedup_key'] ?? ''), 0, 190);
+        $key = (string) ($in['dedup_key'] ?? '');
+        if (mb_strlen($key) > IntegrationKey::ESCALATION_LIMIT) {
+            $key = IntegrationKey::digest('key', $key);
+        }
         // Uma trava por instalação preserva a igualdade definida pela collation
         // do banco, inclusive para chaves que diferem em maiúsculas ou acentos.
         while (true) {
-            [$id, $created] = $key === '' ? self::findOrCreate($in, $policy, $key)
-                : Lock::run('open', static fn (): array => self::findOrCreate($in, $policy, $key));
+            [$id, $created] = $key === '' ? self::findOrCreate($in, $policy, $key, null)
+                : Lock::run('open', static fn (): array => self::findOrCreate($in, $policy, $key, $legacy));
             if ($created) {
                 break;
             }
@@ -245,9 +249,9 @@ class Escalation extends Base
         return [$id, true];
     }
 
-    private static function findOrCreate(array $in, array $policy, string $key): array
+    private static function findOrCreate(array $in, array $policy, string $key, ?array $legacy): array
     {
-        return Transaction::run(static function () use ($in, $policy, $key): array {
+        return Transaction::run(static function () use ($in, $policy, $key, $legacy): array {
             global $DB;
             if (NativeItem::outcome((string) ($in['source'] ?? 'manual'), (int) ($in['items_id'] ?? 0)) !== null) {
                 throw new RuntimeException('O item de origem já foi encerrado ou excluído.', 409);
@@ -259,6 +263,12 @@ class Escalation extends Base
                 $table = self::TABLE;
                 $query = $DB->doQuery("SELECT id FROM `$table` WHERE dedup_key = $quotedKey AND state IN ('open', 'acked') LIMIT 1 FOR UPDATE");
                 $duplicate = $DB->fetchRow($query);
+                if (!$duplicate && $legacy) {
+                    $id = (int) $legacy['id'];
+                    $source = $DB->quote($legacy['source']);
+                    $legacyKey = $DB->quote($legacy['dedup_key']);
+                    $duplicate = $DB->fetchRow($DB->doQuery("SELECT id FROM `$table` WHERE id = $id AND source = $source AND dedup_key = $legacyKey AND state IN ('open', 'acked') FOR UPDATE"));
+                }
             }
             return $duplicate ? [(int) $duplicate[0], false] : [self::recordOpening($in, $policy, $key), true];
         });

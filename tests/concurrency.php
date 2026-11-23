@@ -15,6 +15,7 @@ use GlpiPlugin\Escalations\Dispatcher;
 use GlpiPlugin\Escalations\Engine;
 use GlpiPlugin\Escalations\Escalation;
 use GlpiPlugin\Escalations\EventIntake;
+use GlpiPlugin\Escalations\ItemWatcher;
 use GlpiPlugin\Escalations\Lock;
 use GlpiPlugin\Escalations\Log;
 use GlpiPlugin\Escalations\Outbox;
@@ -69,6 +70,7 @@ if (($argv[1] ?? '') === 'worker') {
             'resolve' => Escalation::resolve($id, 'manual', (int) $argument),
             'cancel' => Escalation::cancel($id, 'test', (int) $argument),
             'recover' => EventIntake::handle(['title' => 'Concurrency', 'dedup_key' => $argument, 'status' => 'resolved']),
+            'event' => EventIntake::handle(['title' => 'Concurrency', 'dedup_key' => $argument, 'policy_id' => $id]),
             'tick' => Engine::tick(),
             'dispatch' => Dispatcher::retries($id ?: null),
             'cron' => Cron::cronEscalationsrun(new CronTask()),
@@ -750,3 +752,107 @@ check(count(deliveryRows($esc, ['kind' => 'slo_breach:ack', 'status' => 'sent'])
 $copies = iterator_to_array($DB->request(['FROM' => Outbox::TABLE, 'WHERE' => ['escalations_id' => $esc]]), false);
 check(count($copies) === 1 && !str_contains($copies[0]['body_text'], 'Assumir:'), 'historical SLO copy has no ACK action');
 echo "OK closed native origin blocks popup, resend, queued delivery and new SLOs while preserving a historical breach\n";
+
+Settings::set(['sources' => 'plugin,event']);
+$routeA = Policy::save(['name' => 'Route A test', 'is_active' => 1]);
+$routeB = Policy::save(['name' => 'Route B test', 'is_active' => 1]);
+foreach ([$routeA => 'Route Alpha', $routeB => 'Route Beta'] as $pid => $text) {
+    Policy::saveLevel($pid, ['name' => 'N1', 'channels' => ['popup'], 'users' => [$other]]);
+    Policy::saveRule($pid, ['name' => $text, 'source' => 'plugin', 'plugin_type' => 'route-test|tracked',
+        'match_text' => $text, 'sla_pct' => 50, 'is_active' => 1]);
+}
+$aged = ['start_at' => time() - 300, 'due_at' => time() - 30];
+$base = ['plugin' => 'route-test', 'type' => 'tracked'] + $aged;
+foreach (['route-alpha' => 'Route Alpha', 'route-beta' => 'Route Beta', 'route-none' => 'No route here'] as $key => $title) {
+    check(Api::track($base + ['key' => $key, 'title' => $title]), 'track an item for the routing regression');
+}
+ItemWatcher::scan();
+foreach (['route-alpha' => $routeA, 'route-beta' => $routeB] as $key => $pid) {
+    check(countElementsInTable(Escalation::TABLE, ['dedup_key' => Api::dedup('route-test', 'tracked', $key), 'policies_id' => $pid]) === 1,
+        "tracked title selects the expected hierarchy for $key");
+}
+check(countElementsInTable(Api::TRACKED, ['plugin_key' => 'route-test', 'ref_key' => 'route-none', 'status' => 'active']) === 1,
+    'a nonmatching title does not inherit a cached match');
+echo "OK tracked routing distinguishes titles and keeps nonmatching items active\n";
+
+$plugin = str_repeat('p', 40);
+$type = str_repeat('t', 60);
+Policy::saveRule($routeA, ['name' => 'Long API references', 'source' => 'plugin', 'plugin_type' => "$plugin|$type",
+    'sla_pct' => 50, 'is_active' => 1]);
+$api = ['plugin' => $plugin, 'type' => $type, 'title' => 'Long API reference'] + $aged;
+$refs = [str_repeat('x', 110) . 'a', str_repeat('x', 110) . 'b', str_repeat('ç', 125) . 'a', str_repeat('ç', 125) . 'b'];
+foreach ($refs as $ref) {
+    check(Api::track($api + ['key' => $ref]), 'long API reference persisted');
+}
+ItemWatcher::scan();
+check(countElementsInTable(Api::TRACKED, ['plugin_key' => $plugin, 'type_key' => $type, 'status' => 'opened']) === 4,
+    'references beyond both the composition limit and the storage limit get distinct tracking rows');
+$ids = [];
+foreach ($refs as $ref) {
+    $result = Api::escalate($api + ['key' => $ref]);
+    check($result && !$result['created'], 'direct opening deduplicates the same tracked reference');
+    $ids[] = $result['id'];
+}
+check(count(array_unique($ids)) === 4, 'long references sharing prefixes got different occurrences');
+check(Api::resolve($plugin, $type, $refs[2]) && Escalation::get($ids[2])['state'] === 'resolved'
+    && Escalation::get($ids[3])['state'] === 'open'
+    && countElementsInTable(Api::TRACKED, ['escalations_id' => $ids[2], 'status' => 'done']) === 1,
+    'resolution uses the same long identity and leaves its sibling untouched');
+check(Api::dedup('a:b', 'c', 'd') !== Api::dedup('a', 'b', 'c:d'), 'API tuples with embedded delimiters remain distinct');
+check(Api::dedup($plugin, $type . 'a', 'same') !== Api::dedup($plugin, $type . 'b', 'same'), 'overlong slugs cannot merge item identities');
+foreach (['a', 'b'] as $suffix) {
+    Api::registerType($plugin . $suffix, $type, "Overlong plugin $suffix");
+    check(Api::escalate(['plugin' => $plugin . $suffix, 'key' => 'same'] + $api) === null,
+        'an overlong plugin does not inherit the rule for its prefix');
+}
+check(countElementsInTable(Api::SOURCES, ['label' => ['Overlong plugin a', 'Overlong plugin b']]) === 2,
+    'overlong plugin names with the same prefix register distinct routing keys');
+echo "OK API tracks, opens, deduplicates and resolves distinct long and composite references\n";
+
+$legacyRef = str_repeat('l', 105);
+$legacyKey = mb_substr("plugin:$plugin:$type:$legacyRef", 0, 190);
+[$legacyApi] = Escalation::open(['source' => 'plugin'] + openInput($routeA, $legacyKey));
+check(Api::track($api + ['key' => $legacyRef]), 'prepare historical tracking link');
+$DB->update(Api::TRACKED, ['status' => 'opened', 'escalations_id' => $legacyApi], ['plugin_key' => $plugin, 'type_key' => $type, 'ref_key' => $legacyRef]);
+$legacyRepeat = Api::escalate($api + ['key' => $legacyRef]);
+check($legacyRepeat && !$legacyRepeat['created'] && $legacyRepeat['id'] === $legacyApi, 'existing tracked link deduplicates against the historical key');
+check(Api::resolve($plugin, $type, $legacyRef) && Escalation::get($legacyApi)['dedup_key'] === $legacyKey
+    && Escalation::get($legacyApi)['state'] === 'resolved', 'historical tracked occurrence resolves without rewriting the identifier');
+echo "OK historical API key remains recoverable through the existing tracking link\n";
+
+$long = str_repeat('界', 200);
+$events = parallel(['event', $routeA, " $long-a "], ['event', $routeA, "$long-a"], ['event', $routeA, "$long-b"]);
+$codes = array_column(array_slice($events, 0, 2), 'result');
+check(array_sum(array_column($codes, 0)) === 401 && $codes[0][1]['id'] === $codes[1][1]['id']
+    && $events[2]['result'][0] === 201 && $events[2]['result'][1]['id'] !== $codes[0][1]['id'],
+    'concurrent duplicate long keys serialize without matching a different suffix');
+$recoveries = parallel(['recover', 0, " $long-a "], ['recover', 0, "$long-a"]);
+$actions = array_map(static fn (array $result): string => $result['result'][1]['action'], $recoveries);
+sort($actions);
+check($actions === ['ignored', 'resolved'] && Escalation::get($events[2]['result'][1]['id'])['state'] === 'open',
+    'long recovery uses the opening identity and resolves once');
+
+$historicalPrefix = str_repeat('h', 190);
+[$historical] = Escalation::open(['source' => 'event'] + openInput($routeA, $historicalPrefix));
+$event = ['title' => 'Historical event', 'policy_id' => $routeA];
+check(EventIntake::handle($event + ['status' => 'OK', 'dedup_key' => "$historicalPrefix-original"])[1]['action'] === 'ignored',
+    'a truncated historical prefix is not enough to recover an occurrence');
+check(EventIntake::handle($event + ['dedup_key' => " $historicalPrefix "])[1]['id'] === $historical
+    && EventIntake::handle($event + ['status' => 'OK', 'dedup_key' => $historicalPrefix])[1]['action'] === 'resolved'
+    && Escalation::get($historical)['dedup_key'] === $historicalPrefix,
+    'the explicitly supplied persisted identifier still supports deduplication and recovery');
+
+$generated = ['source' => 'legacy-system', 'trigger_id' => 7, 'host' => 'node'];
+$oldGeneratedKey = 'evt:' . sha1('legacy-system|7|node');
+[$historicalAuto] = Escalation::open(['source' => 'event'] + openInput($routeA, $oldGeneratedKey));
+check(EventIntake::handle($event + $generated)[1]['id'] === $historicalAuto
+    && EventIntake::handle($event + $generated + ['value' => 0])[1]['action'] === 'resolved',
+    'unambiguous historical generated keys remain compatible');
+$system = str_repeat('z', 40);
+[, $generatedA] = EventIntake::handle($event + ['source' => "$system-a", 'trigger_id' => 'group|7', 'host' => 'node']);
+[, $generatedB] = EventIntake::handle($event + ['source' => "$system-b", 'trigger_id' => 'group|7', 'host' => 'node']);
+[, $generatedC] = EventIntake::handle($event + ['source' => "$system-a", 'trigger_id' => 'group', 'host' => '7|node']);
+check(count(array_unique([$generatedA['id'], $generatedB['id'], $generatedC['id']])) === 3
+    && EventIntake::handle(['title' => 'Different recovery title', 'source' => "$system-a", 'trigger_id' => 'group|7', 'host' => 'node', 'value' => 0])[1]['action'] === 'resolved',
+    'generated keys keep the full system and tuple boundaries from opening through recovery');
+echo "OK webhook keys handle concurrency, long inputs, composite boundaries and historical identifiers\n";
