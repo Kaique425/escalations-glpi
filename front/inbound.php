@@ -7,6 +7,7 @@
  */
 
 use GlpiPlugin\Escalations\Channels;
+use GlpiPlugin\Escalations\Dispatcher;
 use GlpiPlugin\Escalations\Escalation;
 use GlpiPlugin\Escalations\Log;
 use GlpiPlugin\Escalations\Settings;
@@ -69,7 +70,9 @@ foreach ((array) ($data['entry'] ?? []) as $entry) {
             // qual escalonamento? o número informado, ou o último que avisou este usuário e ainda aguarda ACK
             $escId = (int) ($mm[2] ?? 0);
             if (!$escId) {
-                foreach ($DB->request(['SELECT' => 'escalations_id', 'FROM' => Escalation::DELIVERIES, 'WHERE' => ['users_id' => $uid, 'channel' => 'whatsapp', 'kind' => 'level'], 'ORDER' => ['id DESC'], 'LIMIT' => 10]) as $d) {
+                foreach ($DB->request(['SELECT' => 'escalations_id', 'FROM' => Escalation::DELIVERIES, 'WHERE' => [
+                    'users_id' => $uid, 'channel' => 'whatsapp', 'kind' => 'level', 'status' => ['sent', 'sending', 'uncertain'],
+                ], 'ORDER' => ['id DESC'], 'LIMIT' => 10]) as $d) {
                     $cand = Escalation::get((int) $d['escalations_id']);
                     if ($cand && $cand['state'] === 'open') {
                         $escId = (int) $cand['id'];
@@ -83,6 +86,7 @@ foreach ((array) ($data['entry'] ?? []) as $entry) {
                     throw new RuntimeException('Não encontrei um escalonamento seu aguardando ACK, ou você só é notificado e não pode assumir.');
                 }
                 Escalation::ack($escId, $uid, 'whatsapp');
+                Dispatcher::flush($escId);
                 Log::write($e, 'inbound', ['channel' => 'whatsapp', 'status' => 'ok', 'users_id' => $uid, 'actor' => 'whatsapp', 'message' => 'Resposta "' . trim($text) . '" recebida de ' . Ui::userName($uid) . '.']);
                 Channels::whatsappReply($from, '✅ ACK registrado em ' . $e['trace_id'] . '. A escalada foi interrompida.');
             } catch (Throwable $x) {

@@ -346,7 +346,8 @@ class Escalation extends Base
             'ack_breached' => $breached, 'date_mod' => $now], ['id' => $id, 'state' => 'open']);
         self::requireTransition();
         $DB->update(self::DELIVERIES, ['status' => 'acked', 'date_mod' => $now], [
-            'escalations_id' => $id, 'channel' => 'popup', 'kind' => 'level', 'role' => 'act', 'status' => ['queued', 'shown'],
+            'escalations_id' => $id, 'channel' => 'popup', 'status' => ['queued', 'shown'],
+            ['OR' => [['kind' => 'level', 'role' => 'act'], ['kind' => 'slo_warn:ack']]],
         ]);
         $tta = time() - strtotime((string) $e['opened_at']);
         Log::write($e, 'ack', ['status' => 'ok', 'users_id' => $uid, 'actor' => $via === 'whatsapp' ? 'whatsapp' : 'user', 'level' => (int) $e['level'],

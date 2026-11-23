@@ -37,7 +37,7 @@ try {
     if ($do === 'ack') {
         $id = (int) ($_POST['id'] ?? 0);
         $msg = Actions::run('ack', $id, $uid, 'popup');
-        Dispatcher::retries($id);
+        Dispatcher::flush($id);
     } elseif ($do === 'snooze' && $delivery) {
         Escalation::snooze($delivery, $uid);
         $msg = 'Adiado.';

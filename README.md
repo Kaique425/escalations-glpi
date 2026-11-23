@@ -28,7 +28,7 @@ Chave/pasta: `escalations` · namespace `GlpiPlugin\Escalations` · tabelas `glp
 
 ## Recuperação de entregas
 
-O nível, o marco de SLO e as respectivas entregas são gravados juntos. O motor processa pendências confirmadas no banco, inclusive as de chamadas à API. A ficha, o pop-up de ACK e a abertura por webhook também tentam processar a fila da ocorrência logo após a gravação.
+O nível, o marco de SLO e as respectivas entregas são gravados juntos. A ficha, o pop-up de ACK, o webhook, a API e o ACK por WhatsApp tentam processar a fila da ocorrência após a gravação. Se houver uma transação do chamador em andamento, o motor assume o processamento após o commit.
 
 Falhas retornadas pelo canal mantêm as tentativas e o canal reserva configurados. Uma tentativa interrompida durante o envio fica **sem confirmação** na ficha. Como o provedor pode tê-la aceitado, o motor não repete essa tentativa nem aciona o canal reserva automaticamente. O mesmo vale para entradas antigas em fila cujo estado não permite saber se o transporte já foi chamado.
 

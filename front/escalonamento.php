@@ -34,7 +34,7 @@ if (!$id && !empty($_GET['novo'])) {
                 'policies_id' => $policy, 'source' => 'manual', 'source_ref' => 'manual', 'title' => (string) $_POST['title'], 'summary' => (string) ($_POST['summary'] ?? ''),
                 'severity' => (int) ($_POST['severity'] ?? 3), 'facts' => ['Aberto por' => Ui::userName((int) Session::getLoginUserID())], 'actor' => 'user',
             ]);
-            Dispatcher::retries($newId);
+            Dispatcher::flush($newId);
             Session::addMessageAfterRedirect('Escalonamento aberto. Consulte as entregas do primeiro nível na ficha.', false, INFO);
             $go = $self . '?id=' . $newId;
         } catch (Throwable $e) {
@@ -75,8 +75,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $err = $msg;
             }
         } else {
-            $msg = Actions::run((string) ($_POST['do'] ?? ''), $id, (int) Session::getLoginUserID(), 'glpi', $_POST);
-            Dispatcher::retries($id);
+            $action = (string) ($_POST['do'] ?? '');
+            $msg = Actions::run($action, $id, (int) Session::getLoginUserID(), 'glpi', $_POST);
+            if ($action !== 'silence') {
+                Dispatcher::flush($id);
+            }
         }
     } catch (Throwable $x) {
         $err = $x->getMessage();

@@ -67,6 +67,7 @@ class EventIntake
                         throw $exception;
                     }
                     Log::write($e, 'webhook', ['status' => 'ok', 'actor' => 'webhook', 'message' => 'Recuperação recebida de ' . $system . ($host ? ' (' . $host . ')' : '') . '.', 'detail' => self::safe($p)]);
+                    Dispatcher::flush((int) $e['id']);
                     return [200, ['ok' => true, 'action' => 'resolved', 'trace_id' => $e['trace_id']]];
                 }
                 Log::write(null, 'webhook', ['status' => 'info', 'actor' => 'webhook', 'message' => 'Recuperação sem escalonamento aberto: ' . $title, 'detail' => self::safe($p)]);
@@ -98,6 +99,7 @@ class EventIntake
             $e = Escalation::get($id);
             if ($created) {
                 Log::write($e, 'webhook', ['status' => 'ok', 'actor' => 'webhook', 'message' => 'Evento recebido de ' . $system . ' e escalonamento aberto.', 'detail' => self::safe($p)]);
+                Dispatcher::flush($id);
             }
             return [$created ? 201 : 200, ['ok' => true, 'action' => $created ? 'opened' : 'deduplicated', 'trace_id' => $e['trace_id'], 'id' => $id]];
         } catch (RuntimeException $e) {

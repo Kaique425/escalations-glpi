@@ -67,7 +67,7 @@ if (($argv[1] ?? '') === 'worker') {
             'cancel' => Escalation::cancel($id, 'test', (int) $argument),
             'recover' => EventIntake::handle(['title' => 'Concurrency', 'dedup_key' => $argument, 'status' => 'resolved']),
             'tick' => Engine::tick(),
-            'dispatch' => Dispatcher::retries($id),
+            'dispatch' => Dispatcher::retries($id ?: null),
             'cron' => Cron::cronEscalationsrun(new CronTask()),
             'cli' => cliCycle($cli),
         };
@@ -330,13 +330,26 @@ function interruptWorker(string $event, string $condition, array $operation, ?Cl
                 $beforeKill();
             }
         } finally {
-            if (isset($worker)) {
-                proc_terminate($worker[0], 9);
-            }
-            $DB->doQuery("SELECT RELEASE_LOCK($gate)");
-            if (isset($worker)) {
-                fclose($worker[1][1]);
-                proc_close($worker[0]);
+            try {
+                if (isset($worker)) {
+                    proc_terminate($worker[0], 9);
+                    // Cancela a instrução no servidor antes de abrir o gate do trigger.
+                    if (!empty($connection)) {
+                        try {
+                            $DB->doQuery('KILL CONNECTION ' . (int) $connection);
+                        } catch (mysqli_sql_exception $e) {
+                            if ($e->getCode() !== 1094) { // A sessão pode já ter sido encerrada pelo servidor.
+                                throw $e;
+                            }
+                        }
+                    }
+                }
+            } finally {
+                $DB->doQuery("SELECT RELEASE_LOCK($gate)");
+                if (isset($worker)) {
+                    fclose($worker[1][1]);
+                    proc_close($worker[0]);
+                }
             }
         }
     } finally {
@@ -430,6 +443,19 @@ $DB->rollBack();
 check(!Escalation::get($uncommitted) && deliveryRows($uncommitted) === [], 'caller rollback discards the escalation and its queue');
 echo "OK worker dispatches only committed intents\n";
 
+[$busy] = Escalation::open(openInput($deliveryPolicy, 'busy-queue'));
+for ($i = 0; $i < 49; $i++) {
+    Engine::resend($busy, $user);
+}
+[$ready] = Escalation::open(openInput($deliveryPolicy, 'ready-behind-busy'));
+Escalation::withLock($busy, static function () use ($busy, $ready): void {
+    check(count(deliveryRows($busy, ['status' => 'queued'])) === 50, 'the first dispatch page is occupied');
+    check(parallel(['dispatch'])[0]['code'] === 200
+        && count(deliveryRows($ready, ['status' => 'sent'])) === 1, 'a locked first page does not starve other occurrences');
+});
+check(Dispatcher::retries($busy) === 50 && Dispatcher::retries($busy) === 0, 'the occupied batch recovers when its lock is released');
+echo "OK a contended queue page does not starve later deliveries\n";
+
 withLocalReceiver(static function (string $url, Closure $received) use ($DB, $user, $other): void {
     $users = iterator_to_array($DB->request(['SELECT' => 'id', 'FROM' => 'glpi_users',
         'WHERE' => ['is_active' => 1, 'is_deleted' => 0], 'ORDER' => 'id', 'LIMIT' => 3]), false);
@@ -441,9 +467,25 @@ withLocalReceiver(static function (string $url, Closure $received) use ($DB, $us
     Settings::set(['wa_provider' => 'webhook', 'wa_webhook_url' => $url, 'max_attempts' => '2']);
     $policy = Policy::save(['name' => 'Multiple recipients', 'users_id_owner' => $user, 'is_active' => 1]);
     Policy::saveLevel($policy, ['name' => 'N1', 'channels' => ['whatsapp'], 'users' => $ids]);
+    $DB->beginTransaction();
+    try {
+        [$uncommitted] = Escalation::open(openInput($policy, 'no-local-transaction-send'));
+        check(count(deliveryRows($uncommitted, ['status' => 'queued'])) === 3, 'the caller sees its staged batch');
+        check(Dispatcher::retries($uncommitted) === 0 && $received() === [], 'the same connection cannot send uncommitted intents');
+    } finally {
+        $DB->rollBack();
+    }
+    check(deliveryRows($uncommitted) === [], 'the rolled back batch leaves no delivery');
+
     [$multi] = Escalation::open(openInput($policy, 'interrupted-multi'));
     $batch = deliveryRows($multi);
     check(array_column($batch, 'status') === ['queued', 'queued', 'queued'], 'entire recipient batch committed before any send');
+
+    $first = (int) $batch[0]['id'];
+    interruptWorker('UPDATE', "NEW.id = $first AND NEW.status = 'sending'", ['dispatch', $multi]);
+    check(array_column(deliveryRows($multi), 'status') === ['queued', 'queued', 'queued'] && $received() === [],
+        'interruption before claiming the first attempt leaves the whole batch recoverable');
+    echo "OK worker killed after staging but before transport\n";
 
     $second = (int) $batch[1]['id'];
     interruptWorker('UPDATE', "NEW.id = $second AND NEW.status = 'sent'", ['dispatch', $multi], static function () use ($multi, $received): void {
@@ -537,4 +579,21 @@ withLocalReceiver(static function (string $url, Closure $received) use ($DB, $us
     check(array_map('intval', array_column(deliveryRows($manualResend, ['channel' => 'whatsapp', 'role' => 'act']), 'round')) === [0, 100, 101],
         'explicit manual resends stay independent');
     echo "OK cancellation suppresses pending operational messages and manual resends stay distinct\n";
+
+    [$withoutCopy] = Escalation::open(openInput($policy, 'optional-outbox-failure'));
+    $before = count($received());
+    $outbox = Outbox::TABLE;
+    $DB->doQuery("CREATE TRIGGER esc_test_outbox_failure BEFORE INSERT ON `$outbox` FOR EACH ROW
+        BEGIN IF NEW.escalations_id = $withoutCopy THEN
+            SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Test outbox failure';
+        END IF; END");
+    try {
+        Dispatcher::retries($withoutCopy);
+        check(count(deliveryRows($withoutCopy, ['channel' => 'whatsapp', 'status' => 'sent'])) === 2
+            && count($received()) === $before + 2 && Dispatcher::retries($withoutCopy) === 0,
+            'a failure writing the optional copy does not replay accepted deliveries');
+    } finally {
+        $DB->doQuery('DROP TRIGGER esc_test_outbox_failure');
+    }
+    echo "OK confirmed delivery survives failure of the optional outbox copy\n";
 });

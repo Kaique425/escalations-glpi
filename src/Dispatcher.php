@@ -48,6 +48,9 @@ class Dispatcher
     public static function retries(?int $escalationId = null): int
     {
         global $DB;
+        if (Transaction::isActive()) {
+            return 0;
+        }
         $where = ['channel' => ['<>', 'popup'], ['OR' => [
             ['status' => ['queued', 'sending']],
             ['status' => 'failed', 'next_try' => ['<=', date('Y-m-d H:i:s')]],
@@ -56,16 +59,35 @@ class Dispatcher
             $where['escalations_id'] = $escalationId;
         }
         $n = 0;
-        foreach ($DB->request(['SELECT' => ['id', 'escalations_id'], 'FROM' => Escalation::DELIVERIES,
-            'WHERE' => $where, 'ORDER' => 'id', 'LIMIT' => 50]) as $r) {
-            try {
-                $n += Escalation::withLock((int) $r['escalations_id'], static fn (?array $e): bool =>
-                    $e && self::attempt($e, (int) $r['id']), 0) ? 1 : 0;
-            } catch (Throwable $t) {
-                Log::file('delivery ' . (int) $r['id'] . ': ' . $t->getMessage());
+        $last = 0;
+        // Uma ocorrência ocupada ou uma linha com erro não pode bloquear o restante da fila.
+        do {
+            $cursor = $last;
+            foreach ($DB->request(['SELECT' => ['id', 'escalations_id'], 'FROM' => Escalation::DELIVERIES,
+                'WHERE' => $where + ['id' => ['>', $cursor]], 'ORDER' => 'id', 'LIMIT' => 50]) as $r) {
+                $last = (int) $r['id'];
+                try {
+                    $n += Escalation::withLock((int) $r['escalations_id'], static fn (?array $e): bool =>
+                        $e && self::attempt($e, (int) $r['id']), 0) ? 1 : 0;
+                } catch (Throwable $t) {
+                    Log::file('delivery ' . $last . ': ' . $t->getMessage());
+                }
+                if ($n === 50) {
+                    return $n;
+                }
             }
-        }
+        } while ($last !== $cursor);
         return $n;
+    }
+
+    /** O processamento imediato é opcional após a gravação. O cron recupera a fila restante. */
+    public static function flush(int $escalationId): void
+    {
+        try {
+            self::retries($escalationId);
+        } catch (Throwable $t) {
+            Log::file('dispatch ' . $escalationId . ': ' . $t->getMessage());
+        }
     }
 
     /** Uma tentativa sob a trava da ocorrência. O estado sending é persistido antes do transporte. */

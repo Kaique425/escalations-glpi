@@ -93,6 +93,9 @@ class Api
                 'dedup_key' => $n['dedup'], 'title' => $n['title'], 'summary' => $n['summary'], 'severity' => $n['severity'], 'entities_id' => $n['entities_id'], 'facts' => $n['facts'], 'actor' => 'plugin',
             ]);
             $e = Escalation::get($id);
+            if ($created) {
+                Dispatcher::flush($id);
+            }
             return ['id' => $id, 'trace_id' => (string) ($e['trace_id'] ?? ''), 'created' => $created];
         } catch (Throwable $e) {
             Log::file('Api::escalate: ' . $e->getMessage());
@@ -155,6 +158,7 @@ class Api
             $hit = false;
             foreach ($DB->request(['FROM' => Escalation::TABLE, 'WHERE' => ['dedup_key' => self::dedup($plugin, $type, $key), 'state' => ['open', 'acked']]]) as $e) {
                 Escalation::resolve((int) $e['id'], 'plugin ' . $plugin, 0, $note);
+                Dispatcher::flush((int) $e['id']);
                 $hit = true;
             }
             return $hit;
