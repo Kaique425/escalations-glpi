@@ -109,6 +109,9 @@ class Dispatcher
             self::discard($e, $d, 'uncertain', 'Envio sem confirmação local. O provedor pode ter recebido a mensagem.');
             return true;
         }
+        if (NativeItem::close($e)) {
+            $e = Escalation::get((int) $e['id']);
+        }
         if (!self::isRelevant($e, $d)) {
             self::discard($e, $d, 'obsolete', 'Envio dispensado após mudança no estado do escalonamento.');
             return true;
@@ -285,7 +288,7 @@ class Dispatcher
             if (!$e) {
                 continue;
             }
-            if (!self::isRelevant($e, $d)) {
+            if (!self::isRelevant($e, $d) || NativeItem::isClosed($e)) {
                 $DB->update(Escalation::DELIVERIES, ['status' => 'acked', 'date_mod' => $now], ['id' => $d['id'], 'status' => ['queued', 'shown']]);
                 continue;
             }

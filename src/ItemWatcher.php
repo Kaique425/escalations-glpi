@@ -33,41 +33,14 @@ class ItemWatcher
         return $n;
     }
 
-    private static function finishedStates(): array
-    {
-        global $DB;
-        static $ids = null;
-        $ids ??= array_map(fn ($r) => (int) $r['id'], iterator_to_array($DB->request(['SELECT' => 'id', 'FROM' => 'glpi_projectstates', 'WHERE' => ['is_finished' => 1]]), false));
-        return $ids;
-    }
-
-    private static function isDone(string $source, array $r): bool
-    {
-        if ($source === 'problem' || $source === 'change') {
-            return (int) $r['status'] >= 5 && (int) $r['status'] <= 6;
-        }
-        return (int) $r['percent_done'] >= 100 || in_array((int) $r['projectstates_id'], self::finishedStates(), true);
-    }
-
     /** Fecha o escalonamento de item nativo concluído, excluído ou cancelado. */
     private static function autoClose(): int
     {
         global $DB;
         $n = 0;
         foreach ($DB->request(['FROM' => Escalation::TABLE, 'WHERE' => ['source' => array_keys(self::DEFS), 'state' => ['open', 'acked']], 'LIMIT' => 500]) as $e) {
-            $def = self::DEFS[$e['source']];
-            $row = null;
-            foreach ($DB->request(['FROM' => $def['table'], 'WHERE' => ['id' => (int) $e['items_id']]]) as $r) {
-                $row = $r;
-            }
             try {
-                if (!$row || (int) $row['is_deleted']) {
-                    Escalation::cancel((int) $e['id'], mb_strtolower($def['label']) . ' #' . (int) $e['items_id'] . ' foi excluído.');
-                    $n++;
-                } elseif (self::isDone($e['source'], $row)) {
-                    Escalation::resolve((int) $e['id'], mb_strtolower($def['label']) . ' concluído');
-                    $n++;
-                }
+                $n += (int) Escalation::withLock((int) $e['id'], NativeItem::close(...), 0);
             } catch (Throwable $x) {
                 Log::file('autoClose ' . $e['trace_id'] . ': ' . $x->getMessage());
             }
@@ -83,6 +56,7 @@ class ItemWatcher
         if (!$active) {
             return 0;
         }
+        $finishedStates = null;
         foreach (self::DEFS as $source => $def) {
             if (!Settings::sourceOn($source)) {
                 continue;
@@ -92,10 +66,16 @@ class ItemWatcher
             foreach ($rules as $r) {
                 $where = ['is_deleted' => 0, ['NOT' => [$def['end'] => null]]];
                 if ($source === 'problem' || $source === 'change') {
-                    $where[] = ['NOT' => ['status' => [5, 6]]];
+                    $where[] = ['NOT' => ['status' => NativeItem::terminalStatuses($source)]];
                 } else {
                     $where['percent_done'] = ['<', 100];
                     $where['is_template'] = 0;
+                    $finishedStates ??= array_column(iterator_to_array($DB->request([
+                        'SELECT' => 'id', 'FROM' => 'glpi_projectstates', 'WHERE' => ['is_finished' => 1],
+                    ]), false), 'id');
+                    if ($finishedStates) {
+                        $where[] = ['NOT' => ['projectstates_id' => $finishedStates]];
+                    }
                 }
                 if ((int) $r['entities_id'] >= 0) {
                     $where['entities_id'] = array_map('intval', array_values(getSonsOf('glpi_entities', (int) $r['entities_id'])));
@@ -108,7 +88,7 @@ class ItemWatcher
                 }
                 foreach ($DB->request(['FROM' => $def['table'], 'WHERE' => $where, 'LIMIT' => 300]) as $t) {
                     $id = (int) $t['id'];
-                    if (isset($seen[$id]) || ($r['match_text'] !== '' && stripos((string) $t['name'], $r['match_text']) === false) || self::isDone($source, $t)) {
+                    if (isset($seen[$id]) || ($r['match_text'] !== '' && stripos((string) $t['name'], $r['match_text']) === false)) {
                         continue;
                     }
                     $begin = strtotime((string) ($t[$def['begin']] ?: $t['date_creation'] ?: 'now'));

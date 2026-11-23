@@ -9,6 +9,7 @@
  */
 
 use Glpi\Kernel\Kernel;
+use GlpiPlugin\Escalations\Api;
 use GlpiPlugin\Escalations\Cron;
 use GlpiPlugin\Escalations\Dispatcher;
 use GlpiPlugin\Escalations\Engine;
@@ -19,6 +20,8 @@ use GlpiPlugin\Escalations\Log;
 use GlpiPlugin\Escalations\Outbox;
 use GlpiPlugin\Escalations\Policy;
 use GlpiPlugin\Escalations\Settings;
+use GlpiPlugin\Escalations\TicketWatcher;
+use GlpiPlugin\Escalations\Transaction;
 
 if (PHP_SAPI !== 'cli') {
     http_response_code(404);
@@ -597,3 +600,153 @@ withLocalReceiver(static function (string $url, Closure $received) use ($DB, $us
     }
     echo "OK confirmed delivery survives failure of the optional outbox copy\n";
 });
+
+function expectConflict(int $code, Closure $action, string $label): void
+{
+    try {
+        $action();
+    } catch (RuntimeException $e) {
+        check($e->getCode() === $code, $label);
+        return;
+    }
+    check(false, $label);
+}
+
+Config::deleteConfigurationValues(Settings::CONTEXT, ['sources', 'owner_channels']);
+check(Settings::sourceOn('ticket') && Settings::get('owner_channels') === Settings::DEFAULTS['owner_channels'],
+    'defaults apply when the configuration keys are absent');
+Settings::set(['sources' => '', 'owner_channels' => '', 'wa_provider' => 'off', 'last_scan' => '']);
+check(Settings::sourceOn('manual') && !array_filter(array_keys(Settings::SOURCE_LABELS), Settings::sourceOn(...)),
+    'explicit empty source selection leaves only manual openings enabled');
+check(Settings::channels(Settings::get('owner_channels')) === [], 'explicit empty owner channel selection survives persistence');
+check(EventIntake::handle(['title' => 'Disabled webhook'])[0] === 403, 'explicit empty sources also disables webhook intake');
+echo "OK explicit empty configurations stay empty, with defaults for missing keys\n";
+
+$invalid = Policy::save(['name' => 'Invalid N1', 'is_active' => 1]);
+$before = array_map(fn (string $table): int => countElementsInTable($table), [Escalation::TABLE, Log::TABLE, Escalation::DELIVERIES]);
+expectConflict(422, static fn () => Escalation::open(openInput($invalid, 'missing-n1')), 'direct opening reports missing N1');
+$second = Policy::saveLevel($invalid, ['name' => 'N2', 'channels' => ['popup'], 'users' => [$user]]);
+$DB->update(Policy::LEVELS, ['position' => 2], ['id' => $second]);
+Settings::set(['sources' => 'event,plugin']);
+check(EventIntake::handle(['policy_id' => $invalid, 'title' => 'Only N2'])[0] === 422, 'webhook reports missing N1');
+Policy::saveRule($invalid, ['name' => 'Invalid N1 API', 'source' => 'plugin', 'plugin_type' => 'esc-test|invalid', 'is_active' => 1]);
+check((int) (Policy::match('plugin', 3, 0, 0, 'Only N2', 'esc-test', 'invalid')['policies_id'] ?? 0) === $invalid,
+    'the plugin API fixture matches the hierarchy without N1');
+check(Api::escalate(['plugin' => 'esc-test', 'type' => 'invalid', 'key' => 'missing-n1', 'title' => 'Only N2']) === null,
+    'plugin API reports missing N1 as failure');
+$first = Policy::saveLevel($invalid, ['position' => 1, 'name' => 'N1', 'channels' => ['popup'], 'users' => [$user]]);
+$DB->update(Policy::LEVELS, ['channels' => 'unknown'], ['id' => $first]);
+expectConflict(422, static fn () => Escalation::open(openInput($invalid, 'unknown-n1-channel')), 'N1 requires a known channel');
+$DB->update(Policy::LEVELS, ['channels' => 'popup'], ['id' => $first]);
+$DB->delete(Policy::TARGETS, ['levels_id' => $first]);
+expectConflict(422, static fn () => Escalation::open(openInput($invalid, 'no-n1-target')), 'N1 requires a configured target');
+check(array_map(fn (string $table): int => countElementsInTable($table), [Escalation::TABLE, Log::TABLE, Escalation::DELIVERIES]) === $before,
+    'invalid N1 leaves no occurrence, audit entry or delivery');
+[$legacyNoLevel] = Escalation::open(openInput($invalid, 'legacy-no-n1') + ['no_start' => true]);
+expectConflict(409, static fn () => Escalation::open(openInput($invalid, 'legacy-no-n1')), 'legacy level-zero row cannot be reported as a successful deduplication');
+check((int) Escalation::get($legacyNoLevel)['occurrences'] === 1, 'rejected legacy deduplication does not increment occurrences');
+$DB->insert('glpi_groups', ['name' => 'Empty N1 group']);
+Policy::saveLevel($invalid, ['name' => 'N1', 'channels' => ['popup'], 'groups' => [(int) $DB->insertId()]], $first);
+[$emptyGroup] = Escalation::open(openInput($invalid, 'empty-n1-group'));
+check(countEvents($emptyGroup, 'no_recipient') === 1, 'a configured but empty group preserves skip behavior');
+Engine::tick();
+check((int) Escalation::get($emptyGroup)['level'] === 2, 'a configured but empty N1 advances to N2');
+echo "OK invalid N1 fails atomically on all entry points and an empty group still advances\n";
+
+function nativeRow(string $table, array $fields = []): int
+{
+    global $DB;
+    $DB->insert($table, $fields + ['name' => 'Native Escalations regression', 'entities_id' => 0]);
+    return (int) $DB->insertId();
+}
+
+function openNativeFixture(int $policy, string $source, int $item): int
+{
+    return Escalation::open(['source' => $source, 'items_id' => $item] + openInput($policy, "$source:$item"))[0];
+}
+
+$nativePolicy = Policy::save(['name' => 'Native regression', 'users_id_owner' => $user, 'is_active' => 1]);
+Policy::saveLevel($nativePolicy, ['name' => 'N1', 'channels' => ['popup', 'teams', 'email'], 'users' => [$user]]);
+Policy::saveLevel($nativePolicy, ['name' => 'N2', 'channels' => ['popup', 'teams'], 'users' => [$user]]);
+[$noOwnerChannels] = Escalation::open(openInput($nativePolicy, 'empty-owner-channels'));
+$DB->update(Escalation::TABLE, ['ack_due_at' => date('Y-m-d H:i:s', time() - 1)], ['id' => $noOwnerChannels]);
+Engine::tick();
+check(countEvents($noOwnerChannels, 'slo_breach') === 1 && deliveryRows($noOwnerChannels, ['kind' => 'slo_breach:ack']) === [],
+    'empty owner channels keeps the SLO audit without restoring any channel');
+$DB->insert('glpi_projectstates', ['name' => 'Finished regression', 'is_finished' => 1]);
+$finishedState = (int) $DB->insertId();
+$nativeCases = [
+    ['ticket', 'glpi_tickets', ['status' => Ticket::SOLVED], 'resolved'],
+    ['ticket', 'glpi_tickets', ['status' => Ticket::APPROVAL], 'open'],
+    ['ticket', 'glpi_tickets', ['is_deleted' => 1], 'cancelled'],
+    ['problem', 'glpi_problems', ['status' => Problem::CLOSED], 'resolved'],
+    ['problem', 'glpi_problems', ['status' => Problem::OBSERVED], 'open'],
+    ['change', 'glpi_changes', ['status' => Change::SOLVED], 'resolved'],
+    ['change', 'glpi_changes', ['status' => Change::CANCELED], 'cancelled'],
+    ['change', 'glpi_changes', ['status' => Change::REFUSED], 'cancelled'],
+    ['change', 'glpi_changes', ['status' => Change::OBSERVED], 'open'],
+    ['project', 'glpi_projects', ['percent_done' => 100], 'resolved'],
+    ['projecttask', 'glpi_projecttasks', ['projectstates_id' => $finishedState], 'resolved'],
+];
+$cases = [];
+foreach ($nativeCases as [$source, $table, $terminal, $expected]) {
+    $fields = in_array($source, ['project', 'projecttask'], true)
+        ? ['plan_start_date' => date('Y-m-d H:i:s', time() - 3600), 'plan_end_date' => date('Y-m-d H:i:s', time() - 600)]
+        : ['status' => CommonITILObject::INCOMING, 'date' => date('Y-m-d H:i:s', time() - 3600), 'time_to_resolve' => date('Y-m-d H:i:s', time() - 600)];
+    $item = nativeRow($table, $fields);
+    $esc = openNativeFixture($nativePolicy, $source, $item);
+    $DB->update($table, $terminal, ['id' => $item]);
+    $cases[] = [$esc, $expected];
+    if ($expected !== 'open') {
+        expectConflict(409, static fn () => openNativeFixture($nativePolicy, $source, $item), 'finished origin rejects another opening');
+    }
+}
+Settings::set(['sources' => '', 'last_scan' => '']);
+TicketWatcher::scan();
+foreach ($cases as [$esc, $expected]) {
+    check(Escalation::get($esc)['state'] === $expected, "watcher recognizes native state for occurrence $esc");
+}
+echo "OK native closure respects cancelled, refused, completed and ambiguous states\n";
+
+foreach (['change', 'projecttask'] as $source) {
+    Policy::saveRule($nativePolicy, ['name' => "SLA $source", 'source' => $source, 'sla_pct' => 50, 'is_active' => 1]);
+}
+$closedChange = nativeRow('glpi_changes', ['status' => Change::REFUSED, 'date' => date('Y-m-d H:i:s', time() - 3600),
+    'time_to_resolve' => date('Y-m-d H:i:s', time() - 600)]);
+$closedTask = nativeRow('glpi_projecttasks', ['projectstates_id' => $finishedState, 'plan_start_date' => date('Y-m-d H:i:s', time() - 3600),
+    'plan_end_date' => date('Y-m-d H:i:s', time() - 600)]);
+Settings::set(['sources' => 'change,projecttask', 'last_scan' => '']);
+TicketWatcher::scan();
+check(countElementsInTable(Escalation::TABLE, ['dedup_key' => ["change:$closedChange", "projecttask:$closedTask"]]) === 0,
+    'native scan cannot open overdue terminal items');
+
+$item = nativeRow('glpi_changes', ['status' => Change::INCOMING]);
+$esc = openNativeFixture($nativePolicy, 'change', $item);
+$nativeEsc = Escalation::get($esc);
+Escalation::withLock($esc, static fn () => Transaction::run(
+    static fn () => Dispatcher::enqueue($nativeEsc, 0, 'teams', 0, 0, 'slo_breach:ack')
+));
+forceDue($esc);
+$DB->update(Escalation::DELIVERIES, [
+    'status' => 'failed', 'attempts' => 1, 'next_try' => date('Y-m-d H:i:s', time() - 1),
+], ['escalations_id' => $esc, 'kind' => 'level', 'channel' => 'email']);
+$DB->update(Escalation::TABLE, ['resolve_due_at' => date('Y-m-d H:i:s', time() - 30)], ['id' => $esc]);
+$DB->update('glpi_changes', ['status' => Change::CANCELED], ['id' => $item]);
+Settings::set(['last_scan' => date('Y-m-d H:i:s')]);
+expectConflict(409, static fn () => Engine::resend($esc, $user), 'manual resend rejects a closed origin before the scan');
+check(!array_filter(Dispatcher::pending($user, 40), static fn (array $p): bool => $p['esc_id'] === $esc),
+    'popup suppresses the actionable delivery before the scan');
+check(count(deliveryRows($esc, ['kind' => 'level', 'channel' => 'popup', 'status' => 'acked'])) === 1,
+    'the pending popup was discarded while the occurrence was still open');
+Engine::tick();
+check(Escalation::get($esc)['state'] === 'cancelled' && countEvents($esc, ['escalate', 'repeat', 'slo_breach']) === 0,
+    'a throttled scan cannot stage newly obsolete escalations or SLOs');
+check(count(deliveryRows($esc, ['kind' => 'level', 'channel' => 'teams', 'status' => 'obsolete'])) === 1,
+    'dispatcher discards already queued actionable delivery before transport');
+$retry = deliveryRows($esc, ['kind' => 'level', 'channel' => 'email', 'status' => 'obsolete']);
+check(count($retry) === 1 && (int) $retry[0]['attempts'] === 1 && $retry[0]['next_try'] === null,
+    'dispatcher discards the due retry without scheduling another attempt');
+check(count(deliveryRows($esc, ['kind' => 'slo_breach:ack', 'status' => 'sent'])) === 1, 'historical SLO breach remains eligible');
+$copies = iterator_to_array($DB->request(['FROM' => Outbox::TABLE, 'WHERE' => ['escalations_id' => $esc]]), false);
+check(count($copies) === 1 && !str_contains($copies[0]['body_text'], 'Assumir:'), 'historical SLO copy has no ACK action');
+echo "OK closed native origin blocks popup, resend, queued delivery and new SLOs while preserving a historical breach\n";

@@ -249,6 +249,9 @@ class Escalation extends Base
     {
         return Transaction::run(static function () use ($in, $policy, $key): array {
             global $DB;
+            if (NativeItem::outcome((string) ($in['source'] ?? 'manual'), (int) ($in['items_id'] ?? 0)) !== null) {
+                throw new RuntimeException('O item de origem já foi encerrado ou excluído.', 409);
+            }
             $duplicate = null;
             if ($key !== '') {
                 // Leitura atual mesmo se o chamador já abriu uma transação.
@@ -266,6 +269,9 @@ class Escalation extends Base
         global $DB;
         if (!$e || !in_array($e['state'], ['open', 'acked'], true)) {
             return false;
+        }
+        if (!(int) $e['level'] && empty($in['no_start'])) {
+            throw new RuntimeException('Já existe um escalonamento para esta origem sem nível iniciado.', 409);
         }
         $occurrences = (int) $e['occurrences'] + 1;
         $DB->update(self::TABLE, ['occurrences' => $occurrences, 'last_seen' => date('Y-m-d H:i:s')], ['id' => $e['id'], 'state' => $e['state']]);

@@ -71,9 +71,8 @@ class Engine
     public static function stageFirstLevel(array $e): void
     {
         $level = Policy::level((int) $e['policies_id'], 1);
-        if (!$level) {
-            Log::write($e, 'no_recipient', ['status' => 'fail', 'message' => 'A hierarquia não tem o nível 1. Cadastre os níveis em Hierarquias.']);
-            return;
+        if (!$level || !$level['channel_list'] || !$level['targets']) {
+            throw new RuntimeException('Configure o nível 1 da hierarquia com ao menos um canal e um alvo.', 422);
         }
         if (!self::beginLevel($e, $level)) {
             throw new RuntimeException('Não foi possível iniciar o nível 1.');
@@ -110,6 +109,9 @@ class Engine
         Escalation::withLock($id, static function (?array $e) use ($uid): void {
             if (!$e || $e['state'] !== 'open' || !(int) $e['level']) {
                 throw new RuntimeException('Só dá para reenviar enquanto aguarda ACK.', 409);
+            }
+            if (NativeItem::isClosed($e)) {
+                throw new RuntimeException('O item de origem já foi encerrado.', 409);
             }
             $level = Policy::level((int) $e['policies_id'], (int) $e['level']);
             if ($level) {
@@ -162,7 +164,8 @@ class Engine
             || ($e['silenced_until'] && $e['silenced_until'] > $now)
             || $e['next_action_at'] !== $candidate['next_action_at']
             || (int) $e['level'] !== (int) $candidate['level']
-            || (int) $e['repeats'] !== (int) $candidate['repeats']) {
+            || (int) $e['repeats'] !== (int) $candidate['repeats']
+            || NativeItem::isClosed($e)) {
             return 0;
         }
         $pos = (int) $e['level'];
@@ -206,7 +209,7 @@ class Engine
     private static function slo(?array $e): int
     {
         global $DB;
-        if (!$e || !in_array($e['state'], ['open', 'acked'], true)) {
+        if (!$e || !in_array($e['state'], ['open', 'acked'], true) || NativeItem::isClosed($e)) {
             return 0;
         }
         $policy = Policy::get((int) $e['policies_id']);
