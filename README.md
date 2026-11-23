@@ -34,6 +34,16 @@ Falhas retornadas pelo canal mantêm as tentativas e o canal reserva configurado
 
 Antes de cada tentativa, o motor confere se o aviso ainda é pertinente. O ACK encerra pedidos de ação pendentes e preserva avisos informativos válidos, como o SLO de resolução. Após o encerramento da ocorrência, os avisos de prazo ainda em curso são dispensados. Estouro de SLO já registrado continua sendo um fato que pode ser comunicado pelos canais externos.
 
+### Modo simulação
+
+A simulação é por canal (Configurações → Caixa de saída e modo simulação). O canal escolhido monta a mensagem e a grava na Caixa de saída com situação **Simulada**, mas não chama SMTP, Teams nem WhatsApp. A Caixa de saída também guarda o conteúdo e o erro quando o envio simulado falha, por exemplo, usuário sem e-mail ou celular.
+
+Uma falha de canal simulado não repete tentativas nem aciona um canal reserva real. O canal reserva só é usado na simulação quando ele também estiver marcado como simulado.
+
+O ACK e a resolução continuam gerando seus avisos no Teams; se o Teams estiver em simulação, eles ficam na Caixa de saída como simulados. No WhatsApp, a resposta automática de confirmação do ACK também é suprimida. Ela não entra na Caixa de saída, que permanece com o propósito original de guardar as mensagens dos níveis e avisos; a supressão fica registrada no log.
+
+Os botões **Testar** em Configurações são envios reais e explícitos, mesmo com a simulação ligada. Use-os apenas para validar o provedor.
+
 ## Para outros plugins (API)
 
 Qualquer plugin, atual ou futuro, escala itens com prazo sem conhecer hierarquias (`src/Api.php`; nunca lança exceção):
@@ -98,7 +108,7 @@ Cria registros `[Teste ESC]`, valida hierarquia, abertura, deduplicação, subid
 - Versão **0.4.0**, testada no **GLPI 12.0** (teste funcional de 40+ verificações, renderização das telas por CLI e chamadas reais ao webhook). **Ainda não testada no GLPI 11** (declara compatibilidade 11.0 a 12.0.x).
 - **Origens ativas por padrão: só o que nasce no GLPI** (chamados, problemas, mudanças, projetos e tarefas de projeto, mais o escalonamento manual). O webhook de eventos e a API para outros plugins vêm **desligados**; ligue em **Configurações → Origens ativas**.
 - `webhook.php` e `inbound.php` ficam fora do login registrando-os no firewall (`Firewall::addPluginStrategyForLegacyScripts` + `SessionManager::registerPluginStatelessPath`, em `setup.php`). No GLPI 12 a variável `$SECURITY_STRATEGY` **não** vale para plugins.
-- Envio real de e-mail, Teams e WhatsApp depende de você configurar cada canal; use o **modo simulação** para testar sem enviar nada.
+- Envio real de e-mail, Teams e WhatsApp depende de você configurar cada canal; use o **modo simulação** para testar sem enviar nada. Os botões de teste são a exceção: eles enviam de verdade para validar o provedor.
 
 ## Pendências e pontos a conferir
 - Resposta do WhatsApp só no provedor Meta; o gateway próprio só envia.

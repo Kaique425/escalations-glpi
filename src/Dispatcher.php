@@ -121,9 +121,12 @@ class Dispatcher
         $announcement = str_starts_with($d['kind'], 'announce:');
         $level = (int) $d['level'] ? Policy::level((int) $e['policies_id'], (int) $d['level']) : null;
         $number = (int) $d['attempts'] + 1;
-        $simulated = Channels::sinked($channel) && ($channel === 'teams' || (string) $d['recipient'] !== '');
-        $enabled = Channels::enabled($channel);
-        $terminal = $announcement || !$enabled;
+        $sinked = Channels::sinked($channel);
+        $simulated = false;
+        // A simulação também vale quando o canal real está desligado: ela não depende do provedor.
+        $enabled = $sinked || Channels::enabled($channel);
+        // Um canal simulado nunca repete a tentativa nem aciona um canal reserva real.
+        $terminal = $announcement || !$enabled || $sinked;
         $copy = [];
         $result = self::failure('Canal desligado ou não configurado.');
         if ($enabled) {
@@ -141,8 +144,15 @@ class Dispatcher
                 return true;
             }
 
-            if ($simulated) {
-                $result = ['ok' => true, 'provider_id' => 'simulado', 'error' => '', 'ms' => 0, 'detail' => ['simulado' => true]];
+            if ($sinked) {
+                if ($channel === 'email' && (string) $d['recipient'] === '') {
+                    $result = self::failure('Usuário sem e-mail cadastrado.');
+                } elseif ($channel === 'whatsapp' && (string) $d['recipient'] === '') {
+                    $result = self::failure('Usuário sem celular cadastrado (campo "Celular" do usuário no GLPI).');
+                } else {
+                    $simulated = true;
+                    $result = Channels::simulationResult();
+                }
             } else {
                 $DB->update(Escalation::DELIVERIES, ['status' => 'sending', 'attempts' => $number, 'next_try' => null, 'date_mod' => $now], [
                     'id' => $id, 'status' => $d['status'], 'attempts' => $d['attempts'],
@@ -212,7 +222,9 @@ class Dispatcher
             Log::write($e, $number > 1 ? 'retry' : 'delivery', [
                 'channel' => $d['channel'], 'level' => (int) $d['level'], 'target_type' => (int) $d['users_id'] ? 'user' : 'channel', 'target_id' => (int) $d['users_id'],
                 'status' => $result['ok'] ? 'ok' : 'fail', 'actor' => 'system', 'duration_ms' => (int) $result['ms'],
-                'message' => $result['ok'] ? $label . ' enviado para ' . $who . ' (tentativa ' . $number . ').' : $label . ' falhou para ' . $who . ' (tentativa ' . $number . '): ' . $result['error'],
+                'message' => $result['ok']
+                    ? $label . ($simulated ? ' simulado para ' : ' enviado para ') . $who . ' (tentativa ' . $number . ').'
+                    : $label . ' falhou para ' . $who . ' (tentativa ' . $number . '): ' . $result['error'],
                 'detail' => ['delivery' => (int) $d['id'], 'kind' => $d['kind'], 'round' => (int) $d['round'], 'attempt' => $number, 'provider_id' => $result['provider_id']] + $result['detail'],
             ]);
             return !$result['ok'] && !$retry ? self::stageFallback($e, $d) : null;
@@ -226,7 +238,14 @@ class Dispatcher
     private static function stageFallback(array $e, array $d): ?int
     {
         $fb = Settings::get('fallback_channel');
-        if ($fb === '' || $fb === 'none' || $fb === $d['channel'] || !(int) $d['users_id'] || !Channels::enabled($fb)) {
+        if ($fb === '' || $fb === 'none' || $fb === $d['channel'] || !(int) $d['users_id']
+            || (!Channels::enabled($fb) && !Channels::sinked($fb))) {
+            return null;
+        }
+        if (Channels::sinked((string) $d['channel']) && !Channels::sinked($fb)) {
+            Log::write($e, 'delivery', ['channel' => (string) $d['channel'], 'level' => (int) $d['level'], 'status' => 'warn', 'target_type' => 'user', 'target_id' => (int) $d['users_id'], 'actor' => 'system',
+                'message' => (Policy::CHANNELS[$d['channel']][0] ?? $d['channel']) . ' simulado falhou para ' . Ui::userName((int) $d['users_id'])
+                    . '; o canal reserva (' . (Policy::CHANNELS[$fb][0] ?? $fb) . ') não foi acionado para não enviar de verdade durante a simulação.']);
             return null;
         }
         $id = self::enqueue($e, (int) $d['level'], $fb, (int) $d['users_id'], (int) $d['round'], $d['kind'], $d['role']);

@@ -88,10 +88,18 @@ foreach ((array) ($data['entry'] ?? []) as $entry) {
                 Escalation::ack($escId, $uid, 'whatsapp');
                 Dispatcher::flush($escId);
                 Log::write($e, 'inbound', ['channel' => 'whatsapp', 'status' => 'ok', 'users_id' => $uid, 'actor' => 'whatsapp', 'message' => 'Resposta "' . trim($text) . '" recebida de ' . Ui::userName($uid) . '.']);
-                Channels::whatsappReply($from, '✅ ACK registrado em ' . $e['trace_id'] . '. A escalada foi interrompida.');
+                $reply = Channels::whatsappReply($from, '✅ ACK registrado em ' . $e['trace_id'] . '. A escalada foi interrompida.');
+                if (!empty($reply['detail']['simulado'])) {
+                    Log::write($e, 'inbound', ['channel' => 'whatsapp', 'status' => 'info', 'users_id' => $uid, 'actor' => 'whatsapp',
+                        'message' => 'Confirmação do ACK simulada: nenhuma mensagem foi enviada ao provedor de WhatsApp.', 'detail' => ['simulado' => true]]);
+                }
             } catch (Throwable $x) {
                 Log::write($e, 'inbound', ['channel' => 'whatsapp', 'status' => 'fail', 'users_id' => $uid, 'actor' => 'whatsapp', 'message' => 'ACK por WhatsApp não registrado: ' . $x->getMessage()]);
-                Channels::whatsappReply($from, '⚠️ ' . $x->getMessage());
+                $reply = Channels::whatsappReply($from, '⚠️ ' . $x->getMessage());
+                if (!empty($reply['detail']['simulado'])) {
+                    Log::write($e, 'inbound', ['channel' => 'whatsapp', 'status' => 'info', 'users_id' => $uid, 'actor' => 'whatsapp',
+                        'message' => 'Resposta de erro do ACK simulada: nenhuma mensagem foi enviada ao provedor de WhatsApp.', 'detail' => ['simulado' => true]]);
+                }
             }
         }
     }

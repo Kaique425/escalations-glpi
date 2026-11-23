@@ -10,6 +10,7 @@
 
 use Glpi\Kernel\Kernel;
 use GlpiPlugin\Escalations\Api;
+use GlpiPlugin\Escalations\Channels;
 use GlpiPlugin\Escalations\Cron;
 use GlpiPlugin\Escalations\Dispatcher;
 use GlpiPlugin\Escalations\Engine;
@@ -18,6 +19,7 @@ use GlpiPlugin\Escalations\EventIntake;
 use GlpiPlugin\Escalations\ItemWatcher;
 use GlpiPlugin\Escalations\Lock;
 use GlpiPlugin\Escalations\Log;
+use GlpiPlugin\Escalations\Message;
 use GlpiPlugin\Escalations\Outbox;
 use GlpiPlugin\Escalations\Policy;
 use GlpiPlugin\Escalations\Settings;
@@ -601,6 +603,103 @@ withLocalReceiver(static function (string $url, Closure $received) use ($DB, $us
         $DB->doQuery('DROP TRIGGER esc_test_outbox_failure');
     }
     echo "OK confirmed delivery survives failure of the optional outbox copy\n";
+
+    // ---------------------------------------------------------------- modo simulação
+    if (Channels::userEmail($user) === '') {
+        $DB->insert('glpi_useremails', ['users_id' => $user, 'email' => 'sim-lab@example.test', 'is_default' => 1]);
+    }
+    $DB->delete('glpi_useremails', ['users_id' => $other]);
+    check(Channels::userEmail($user) !== '' && Channels::userEmail($other) === '',
+        'fixture: one recipient has an e-mail and the other does not');
+
+    $outboxRows = static fn (int $id): array => iterator_to_array($DB->request([
+        'FROM' => Outbox::TABLE, 'WHERE' => ['escalations_id' => $id], 'ORDER' => 'id',
+    ]), false);
+
+    Settings::set(['sources' => 'manual', 'sink' => 'email', 'mail_enabled' => '0', 'teams_enabled' => '1',
+        'teams_url' => $url, 'wa_provider' => 'off', 'fallback_channel' => 'teams', 'max_attempts' => '3',
+        'outbox' => '1', 'owner_channels' => 'popup']);
+    $emailPolicy = Policy::save(['name' => 'Simulation e-mail', 'users_id_owner' => $user, 'is_active' => 1]);
+    Policy::saveLevel($emailPolicy, ['name' => 'N1', 'channels' => ['email'], 'users' => [$user]]);
+    $before = count($received());
+    [$simMail] = Escalation::open(['title' => 'Simulated e-mail message'] + openInput($emailPolicy, 'sim-email-message'));
+    check(Dispatcher::retries($simMail) === 1 && Dispatcher::retries($simMail) === 0, 'the simulated e-mail is processed once');
+    $rows = deliveryRows($simMail);
+    check(count($received()) === $before && count($rows) === 1 && $rows[0]['status'] === 'sent'
+        && $rows[0]['provider_id'] === 'simulado' && $rows[0]['channel'] === 'email',
+        'a simulated channel works even with mail disabled and never reaches a real fallback');
+    $copies = $outboxRows($simMail);
+    check(count($copies) === 1 && $copies[0]['status'] === 'sim' && $copies[0]['subject'] !== ''
+        && str_contains((string) $copies[0]['body_html'], 'Simulated e-mail message'),
+        'the outbox keeps the exact simulated e-mail content and result');
+
+    $missingPolicy = Policy::save(['name' => 'Simulation without e-mail', 'users_id_owner' => $user, 'is_active' => 1]);
+    Policy::saveLevel($missingPolicy, ['name' => 'N1', 'channels' => ['email'], 'users' => [$other]]);
+    $before = count($received());
+    [$simMissing] = Escalation::open(['title' => 'Simulated e-mail missing recipient'] + openInput($missingPolicy, 'sim-email-missing'));
+    check(Dispatcher::retries($simMissing) === 1 && Dispatcher::retries($simMissing) === 0, 'the invalid simulated e-mail is terminal');
+    $rows = deliveryRows($simMissing);
+    check(count($received()) === $before && count($rows) === 1 && $rows[0]['status'] === 'failed'
+        && $rows[0]['next_try'] === null && str_contains((string) $rows[0]['error'], 'sem e-mail')
+        && count(deliveryRows($simMissing, ['channel' => 'teams'])) === 0,
+        'a simulated failure does not retry or fall back to a real channel');
+    $copies = $outboxRows($simMissing);
+    check(count($copies) === 1 && $copies[0]['status'] === 'failed' && str_contains((string) $copies[0]['error'], 'sem e-mail')
+        && str_contains((string) $copies[0]['body_html'], 'Simulated e-mail missing recipient'),
+        'the outbox records the content and the failed simulated result');
+    echo "OK simulated e-mail stays local and reports its result in the outbox\n";
+
+    Settings::set(['sink' => 'whatsapp,teams', 'wa_provider' => 'webhook', 'wa_webhook_url' => $url,
+        'teams_enabled' => '1', 'teams_url' => $url, 'fallback_channel' => 'none', 'owner_channels' => 'popup']);
+    $waPolicy = Policy::save(['name' => 'Simulation WhatsApp', 'users_id_owner' => $user, 'is_active' => 1]);
+    Policy::saveLevel($waPolicy, ['name' => 'N1', 'channels' => ['whatsapp'], 'users' => [$user]]);
+    $before = count($received());
+    [$simWa] = Escalation::open(['title' => 'Simulated WhatsApp message'] + openInput($waPolicy, 'sim-wa-message'));
+    check(Dispatcher::retries($simWa) === 1 && Dispatcher::retries($simWa) === 0, 'the simulated WhatsApp is processed once');
+    $rows = deliveryRows($simWa, ['channel' => 'whatsapp', 'kind' => 'level']);
+    check(count($received()) === $before && count($rows) === 1 && $rows[0]['status'] === 'sent' && $rows[0]['provider_id'] === 'simulado',
+        'simulated WhatsApp never reaches the gateway');
+    $copies = $outboxRows($simWa);
+    check(count($copies) === 1 && $copies[0]['status'] === 'sim'
+        && str_contains((string) $copies[0]['body_text'], 'Simulated WhatsApp message')
+        && str_contains((string) $copies[0]['body_text'], 'Responda *ACK'),
+        'the outbox keeps the exact simulated WhatsApp content');
+
+    Escalation::ack($simWa, $user, 'whatsapp');
+    Dispatcher::retries($simWa);
+    Escalation::resolve($simWa, 'manual', $user);
+    Dispatcher::retries($simWa);
+    check(count($received()) === $before, 'ACK and resolution announcements are suppressed during simulation');
+    $copies = $outboxRows($simWa);
+    $ackCopy = array_values(array_filter($copies, static fn (array $c): bool => str_contains((string) $c['body_text'], 'Reconhecido por')));
+    $resCopy = array_values(array_filter($copies, static fn (array $c): bool => str_contains((string) $c['body_text'], 'Resolvido após')));
+    check(count($ackCopy) === 1 && $ackCopy[0]['status'] === 'sim' && count($resCopy) === 1 && $resCopy[0]['status'] === 'sim'
+        && count(deliveryRows($simWa, ['kind' => ['announce:ack', 'announce:resolve'], 'status' => 'sent'])) === 2,
+        'the outbox records the simulated ACK and resolution announcements');
+    echo "OK simulated WhatsApp, ACK and resolution stay local and keep their outbox copies\n";
+
+    Settings::set(['sink' => 'teams']);
+    $before = count($received());
+    $realReply = Channels::whatsappReply('5511999999999', 'ACK real');
+    check($realReply['ok'] && count($received()) === $before + 1,
+        'a real WhatsApp reply still reaches the gateway when the channel is not simulated');
+    Settings::set(['sink' => 'whatsapp,teams']);
+    $before = count($received());
+    $simReply = Channels::whatsappReply('5511999999999', 'ACK simulated');
+    check($simReply['ok'] && !empty($simReply['detail']['simulado']) && count($received()) === $before,
+        'a simulated WhatsApp reply never reaches the gateway');
+    echo "OK ACK replies respect the WhatsApp simulation\n";
+
+    Settings::set(['sink' => 'teams', 'teams_enabled' => '1', 'teams_url' => $url]);
+    $before = count($received());
+    $realTeams = Channels::teams(Message::context(Escalation::get($simWa), Policy::level($waPolicy, 1), 'level'));
+    check($realTeams['ok'] && count($received()) === $before + 1,
+        'an explicit channel test still sends to the provider while simulation is active');
+    echo "OK explicit channel tests remain real and are documented separately\n";
+
+    Settings::set(['sink' => 'teams', 'mail_enabled' => '0', 'teams_enabled' => '0', 'teams_url' => '',
+        'wa_provider' => 'webhook', 'wa_webhook_url' => $url, 'fallback_channel' => 'none', 'max_attempts' => '2',
+        'owner_channels' => 'popup,whatsapp', 'outbox' => '1', 'sources' => 'manual']);
 });
 
 function expectConflict(int $code, Closure $action, string $label): void
