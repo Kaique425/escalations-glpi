@@ -82,8 +82,8 @@ foreach ((array) ($data['entry'] ?? []) as $entry) {
                 if (!$e || !\GlpiPlugin\Escalations\Perms::can('ack', $e, $uid)) {
                     throw new RuntimeException('Não encontrei um escalonamento seu aguardando ACK, ou você só é notificado e não pode assumir.');
                 }
-                Log::write($e, 'inbound', ['channel' => 'whatsapp', 'status' => 'ok', 'users_id' => $uid, 'actor' => 'whatsapp', 'message' => 'Resposta "' . trim($text) . '" recebida de ' . Ui::userName($uid) . '.']);
                 Escalation::ack($escId, $uid, 'whatsapp');
+                Log::write($e, 'inbound', ['channel' => 'whatsapp', 'status' => 'ok', 'users_id' => $uid, 'actor' => 'whatsapp', 'message' => 'Resposta "' . trim($text) . '" recebida de ' . Ui::userName($uid) . '.']);
                 Channels::whatsappReply($from, '✅ ACK registrado em ' . $e['trace_id'] . '. A escalada foi interrompida.');
             } catch (Throwable $x) {
                 Log::write($e, 'inbound', ['channel' => 'whatsapp', 'status' => 'fail', 'users_id' => $uid, 'actor' => 'whatsapp', 'message' => 'ACK por WhatsApp não registrado: ' . $x->getMessage()]);

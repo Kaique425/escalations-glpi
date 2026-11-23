@@ -58,8 +58,15 @@ class EventIntake
 
             if ($recovery) {
                 foreach (self::openByKey($key) as $e) {
+                    try {
+                        Escalation::resolve((int) $e['id'], 'evento recuperado');
+                    } catch (RuntimeException $exception) {
+                        if ($exception->getCode() === 409) {
+                            return [200, ['ok' => true, 'action' => 'ignored']];
+                        }
+                        throw $exception;
+                    }
                     Log::write($e, 'webhook', ['status' => 'ok', 'actor' => 'webhook', 'message' => 'Recuperação recebida de ' . $system . ($host ? ' (' . $host . ')' : '') . '.', 'detail' => self::safe($p)]);
-                    Escalation::resolve((int) $e['id'], 'evento recuperado');
                     return [200, ['ok' => true, 'action' => 'resolved', 'trace_id' => $e['trace_id']]];
                 }
                 Log::write(null, 'webhook', ['status' => 'info', 'actor' => 'webhook', 'message' => 'Recuperação sem escalonamento aberto: ' . $title, 'detail' => self::safe($p)]);
