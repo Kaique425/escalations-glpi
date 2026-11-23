@@ -23,6 +23,7 @@ use GlpiPlugin\Escalations\Message;
 use GlpiPlugin\Escalations\Outbox;
 use GlpiPlugin\Escalations\Policy;
 use GlpiPlugin\Escalations\Settings;
+use GlpiPlugin\Escalations\Slo;
 use GlpiPlugin\Escalations\TicketWatcher;
 use GlpiPlugin\Escalations\Transaction;
 
@@ -955,3 +956,46 @@ check(count(array_unique([$generatedA['id'], $generatedB['id'], $generatedC['id'
     && EventIntake::handle(['title' => 'Different recovery title', 'source' => "$system-a", 'trigger_id' => 'group|7', 'host' => 'node', 'value' => 0])[1]['action'] === 'resolved',
     'generated keys keep the full system and tuple boundaries from opening through recovery');
 echo "OK webhook keys handle concurrency, long inputs, composite boundaries and historical identifiers\n";
+
+$available = Slo::budget(100, 0, 95.0, 100, 0);
+check(abs($available['allowed'] - 5.0) < 0.0001 && abs($available['remaining'] - 100.0) < 0.0001
+    && abs($available['compliance'] - 100.0) < 0.0001 && abs($available['burn'] - 0.0) < 0.0001
+    && Slo::remainingLabel((float) $available['remaining']) === '100% restante',
+    'available error budget keeps 100% remaining');
+$partial = Slo::budget(100, 2, 95.0, 100, 2);
+check(abs($partial['remaining'] - 60.0) < 0.0001 && abs($partial['compliance'] - 98.0) < 0.0001
+    && abs($partial['burn'] - 0.4) < 0.0001
+    && Slo::remainingLabel((float) $partial['remaining']) === '60% restante',
+    'partially consumed error budget keeps the correct percentage');
+$exhausted = Slo::budget(20, 1, 95.0, 20, 1);
+check(abs($exhausted['remaining'] - 0.0) < 0.0001 && abs($exhausted['compliance'] - 95.0) < 0.0001
+    && abs($exhausted['burn'] - 1.0) < 0.0001
+    && Slo::remainingLabel((float) $exhausted['remaining']) === 'esgotado',
+    'exactly exhausted error budget is labelled as exhausted');
+$over = Slo::budget(2, 1, 95.0, 2, 1);
+check(abs($over['remaining'] - (-100.0)) < 0.0001 && abs($over['allowed'] - 0.1) < 0.0001
+    && abs($over['compliance'] - 50.0) < 0.0001 && abs($over['burn'] - 10.0) < 0.0001
+    && Slo::remainingLabel((float) $over['remaining']) === 'esgotado',
+    'over-budget remains clamped and is not displayed as remaining');
+echo "OK SLO error budget covers available, partial, exhausted and over-budget states\n";
+
+$sloPolicy = Policy::save(['name' => 'SLO budget regression', 'slo_target' => 95, 'slo_window_days' => 30, 'is_active' => 1]);
+[$sloOk] = Escalation::open(['title' => 'SLO budget ok', 'no_start' => true] + openInput($sloPolicy, 'slo-budget-ok'));
+[$sloBad] = Escalation::open(['title' => 'SLO budget breached', 'no_start' => true] + openInput($sloPolicy, 'slo-budget-breached'));
+[$sloCancelled] = Escalation::open(['title' => 'SLO budget cancelled', 'no_start' => true] + openInput($sloPolicy, 'slo-budget-cancelled'));
+$sloNow = date('Y-m-d H:i:s');
+$DB->update(Escalation::TABLE, ['state' => 'resolved', 'acked_at' => $sloNow, 'resolved_at' => $sloNow, 'ack_breached' => 0, 'resolve_breached' => 0], ['id' => $sloOk]);
+$DB->update(Escalation::TABLE, ['state' => 'resolved', 'acked_at' => $sloNow, 'resolved_at' => $sloNow, 'ack_breached' => 1, 'resolve_breached' => 1], ['id' => $sloBad]);
+$DB->update(Escalation::TABLE, ['state' => 'cancelled', 'acked_at' => $sloNow, 'resolved_at' => $sloNow, 'ack_breached' => 1, 'resolve_breached' => 1], ['id' => $sloCancelled]);
+$sloStats = Slo::stats(Policy::get($sloPolicy));
+check($sloStats['total'] === 2 && $sloStats['ack_breaches'] === 1 && $sloStats['res_breaches'] === 1,
+    'SLO stats keep the observed two-escalation scenario and exclude the cancelled row');
+check(abs($sloStats['ack']['compliance'] - 50.0) < 0.0001 && abs($sloStats['res']['compliance'] - 50.0) < 0.0001
+    && abs($sloStats['ack']['allowed'] - 0.1) < 0.0001 && abs($sloStats['ack']['remaining'] - (-100.0)) < 0.0001
+    && abs($sloStats['ack']['burn'] - 10.0) < 0.0001 && $sloStats['status'] === 'estourado'
+    && Slo::remainingLabel((float) $sloStats['ack']['remaining']) === 'esgotado',
+    'SLO stats reproduce the observed 50/50, 0.1 allowed, 10x burn and exhausted label');
+$DB->delete(Log::TABLE, ['escalations_id' => [$sloOk, $sloBad, $sloCancelled]]);
+$DB->delete(Escalation::TABLE, ['id' => [$sloOk, $sloBad, $sloCancelled]]);
+Policy::delete($sloPolicy);
+echo "OK SLO stats exclude cancelled rows and expose the correct budget state\n";
