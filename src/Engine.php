@@ -9,8 +9,8 @@ use Throwable;
  * Motor do escalonamento. A cada minuto (ação automática escalationsrun) ele:
  *  1. sobe de nível (ou repete o último) os escalonamentos sem ACK cujo tempo acabou;
  *  2. confere o SLO de ACK e de resolução: aviso ao atingir o limite de alerta e outro ao estourar;
- *  3. reenvia o que falhou;
- *  4. observa os chamados (SLA) e fecha o que o chamado ou o evento já resolveu (TicketWatcher).
+ *  3. observa os chamados (SLA) e fecha o que o chamado ou o evento já resolveu (TicketWatcher);
+ *  4. processa entregas novas, interrompidas e reenvios.
  * Tudo vira log rastreável.
  */
 class Engine
@@ -35,7 +35,8 @@ class Engine
                 continue;
             }
             try {
-                $n += Escalation::withLock((int) $e['id'], static fn (?array $current): int => self::advance($current, $e), 0) ?? 0;
+                $n += Escalation::withLock((int) $e['id'], static fn (?array $current): int =>
+                    Transaction::run(static fn (): int => self::advance($current, $e)), 0) ?? 0;
             } catch (Throwable $t) {
                 Log::write($e, 'system', ['status' => 'fail', 'message' => 'Erro ao subir o nível: ' . $t->getMessage()]);
                 Log::file('advance ' . $e['trace_id'] . ': ' . $t->getMessage());
@@ -44,41 +45,39 @@ class Engine
         // 2. SLO
         foreach ($DB->request(['FROM' => Escalation::TABLE, 'WHERE' => ['state' => ['open', 'acked']], 'LIMIT' => 500]) as $e) {
             try {
-                $n += Escalation::withLock((int) $e['id'], self::slo(...), 0) ?? 0;
+                $n += Escalation::withLock((int) $e['id'], static fn (?array $current): int =>
+                    Transaction::run(static fn (): int => self::slo($current)), 0) ?? 0;
             } catch (Throwable $t) {
                 Log::file('slo ' . $e['trace_id'] . ': ' . $t->getMessage());
             }
         }
-        // 3. reenvios
-        try {
-            $n += Dispatcher::retries();
-        } catch (Throwable $t) {
-            Log::file('retries: ' . $t->getMessage());
-        }
-        // 4. chamados e eventos
+        // 3. chamados e eventos
         try {
             $n += TicketWatcher::scan();
         } catch (Throwable $t) {
             Log::file('scan: ' . $t->getMessage());
         }
+        // 4. Entregas confirmadas no banco, após verificar o fechamento das origens.
+        try {
+            $n += Dispatcher::retries();
+        } catch (Throwable $t) {
+            Log::file('retries: ' . $t->getMessage());
+        }
         Settings::set(['last_tick_ms' => (string) (int) round((microtime(true) - $t0) * 1000)]);
         return $n;
     }
 
-    /** Inicia o N1 de uma nova ocorrência, se ainda estiver aberta e sem nível. */
-    public static function startLevel(int $id): void
+    /** Grava o N1 e suas entregas dentro da transação de abertura. */
+    public static function stageFirstLevel(array $e): void
     {
-        Escalation::withLock($id, static function (?array $e): void {
-            if (!$e || $e['state'] !== 'open' || (int) $e['level'] !== 0) {
-                return;
-            }
-            $level = Policy::level((int) $e['policies_id'], 1);
-            if (!$level) {
-                Log::write($e, 'no_recipient', ['status' => 'fail', 'message' => 'A hierarquia não tem o nível 1. Cadastre os níveis em Hierarquias.']);
-                return;
-            }
-            self::beginLevel($e, $level);
-        });
+        $level = Policy::level((int) $e['policies_id'], 1);
+        if (!$level) {
+            Log::write($e, 'no_recipient', ['status' => 'fail', 'message' => 'A hierarquia não tem o nível 1. Cadastre os níveis em Hierarquias.']);
+            return;
+        }
+        if (!self::beginLevel($e, $level)) {
+            throw new RuntimeException('Não foi possível iniciar o nível 1.');
+        }
     }
 
     /** Grava o próximo nível antes dos efeitos, sob a trava da ocorrência. */
@@ -114,8 +113,17 @@ class Engine
             }
             $level = Policy::level((int) $e['policies_id'], (int) $e['level']);
             if ($level) {
-                Log::write($e, 'repeat', ['level' => (int) $e['level'], 'status' => 'info', 'users_id' => $uid, 'message' => 'Reenvio manual dos avisos do nível N' . $e['level'] . ' por ' . Ui::userName($uid) . '.']);
-                self::notify($e, $level, (int) $e['repeats'] + 100);
+                Transaction::run(static function () use ($e, $level, $uid): void {
+                    global $DB;
+                    $round = 100;
+                    foreach ($DB->request(['SELECT' => 'round', 'FROM' => Escalation::DELIVERIES, 'WHERE' => [
+                        'escalations_id' => $e['id'], 'level' => $e['level'], 'kind' => 'level', 'round' => ['>=', 100],
+                    ], 'ORDER' => 'round DESC', 'LIMIT' => 1]) as $last) {
+                        $round = (int) $last['round'] + 1;
+                    }
+                    Log::write($e, 'repeat', ['level' => (int) $e['level'], 'status' => 'info', 'users_id' => $uid, 'message' => 'Reenvio manual dos avisos do nível N' . $e['level'] . ' por ' . Ui::userName($uid) . '.']);
+                    self::notify($e, $level, $round);
+                });
             }
         });
     }
@@ -137,11 +145,11 @@ class Engine
         }
         foreach ($channels as $ch) {
             if ($ch === 'teams') {
-                Dispatcher::deliver($e, $level, 'teams', 0, $round);
+                Dispatcher::enqueue($e, (int) $level['position'], 'teams', 0, $round);
                 continue;
             }
             foreach ($roles as $uid => $role) {
-                Dispatcher::deliver($e, $level, $ch, $uid, $round, 'level', $role);
+                Dispatcher::enqueue($e, (int) $level['position'], $ch, $uid, $round, 'level', $role);
             }
         }
     }
@@ -182,7 +190,7 @@ class Engine
         }
         Log::write($e, 'exhausted', ['level' => $pos, 'status' => 'fail', 'actor' => 'system',
             'message' => 'A cadeia esgotou sem ACK. Avisando o responsável pela hierarquia.']);
-        Dispatcher::notifyOwner(Escalation::get((int) $e['id']), 'exhausted');
+        Dispatcher::stageOwnerNotice($e, 'exhausted');
         return 1;
     }
 
@@ -223,13 +231,13 @@ class Engine
                 $DB->update(Escalation::TABLE, [$breachCol => 1, $warnCol => 1, 'date_mod' => date('Y-m-d H:i:s')], ['id' => $e['id']]);
                 Log::write($e, 'slo_breach', ['status' => 'fail', 'actor' => 'system', 'message' => 'SLO de ' . $label . ' estourado (' . $minutes . ' min). Aberto há ' . Ui::dur($now - $opened) . '.',
                     'detail' => ['slo' => $slo, 'limit_min' => $minutes, 'age_s' => $now - $opened]]);
-                Dispatcher::notifyOwner(Escalation::get((int) $e['id']), 'slo_breach:' . $slo);
+                Dispatcher::stageOwnerNotice($e, 'slo_breach:' . $slo);
                 $n++;
             } elseif (!(int) $e[$warnCol] && !(int) $e[$breachCol] && ($now - $opened) >= $total * $warn) {
                 $DB->update(Escalation::TABLE, [$warnCol => 1, 'date_mod' => date('Y-m-d H:i:s')], ['id' => $e['id']]);
                 Log::write($e, 'slo_warn', ['status' => 'warn', 'actor' => 'system', 'message' => 'SLO de ' . $label . ' em risco: ' . (int) $policy['slo_warn_pct'] . '% do prazo de ' . $minutes . ' min já passou.',
                     'detail' => ['slo' => $slo, 'limit_min' => $minutes, 'left_s' => $due - $now]]);
-                Dispatcher::notifyOwner(Escalation::get((int) $e['id']), 'slo_warn:' . $slo);
+                Dispatcher::stageOwnerNotice($e, 'slo_warn:' . $slo);
                 $n++;
             }
         }

@@ -5,6 +5,7 @@
  * (cabeçalho X-Escalations-Token, Authorization: Bearer ou ?token=). Veja a tela de Configurações para o exemplo.
  */
 
+use GlpiPlugin\Escalations\Dispatcher;
 use GlpiPlugin\Escalations\EventIntake;
 use GlpiPlugin\Escalations\Log;
 
@@ -40,4 +41,7 @@ if (!$payload) {
     return;
 }
 [$code, $body] = EventIntake::handle($payload);
+if ($code === 201) {
+    Dispatcher::retries((int) $body['id']);
+}
 $reply($code, $body);

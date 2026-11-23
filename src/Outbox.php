@@ -28,16 +28,12 @@ class Outbox
         if (!Settings::bool('outbox') || $copy === []) {
             return;
         }
-        try {
-            $DB->insert(self::TABLE, [
-                'escalations_id' => (int) $e['id'], 'deliveries_id' => (int) $d['id'], 'trace_id' => (string) $e['trace_id'], 'level' => (int) $d['level'], 'channel' => (string) $d['channel'],
-                'users_id' => (int) $d['users_id'], 'recipient' => mb_substr((string) $d['recipient'], 0, 255), 'subject' => mb_substr((string) $copy[0], 0, 255),
-                'body_html' => mb_substr((string) $copy[1], 0, 200000), 'body_text' => mb_substr((string) $copy[2], 0, 20000), 'status' => $status, 'error' => $error !== '' ? mb_substr($error, 0, 500) : null,
-                'date_creation' => date('Y-m-d H:i:s'),
-            ]);
-        } catch (\Throwable $t) {
-            Log::file('Outbox::record: ' . $t->getMessage());
-        }
+        $DB->insert(self::TABLE, [
+            'escalations_id' => (int) $e['id'], 'deliveries_id' => (int) $d['id'], 'trace_id' => (string) $e['trace_id'], 'level' => (int) $d['level'], 'channel' => (string) $d['channel'],
+            'users_id' => (int) $d['users_id'], 'recipient' => mb_substr((string) $d['recipient'], 0, 255), 'subject' => mb_substr((string) $copy[0], 0, 255),
+            'body_html' => mb_substr((string) $copy[1], 0, 200000), 'body_text' => mb_substr((string) $copy[2], 0, 20000), 'status' => $status, 'error' => $error !== '' ? mb_substr($error, 0, 500) : null,
+            'date_creation' => date('Y-m-d H:i:s'),
+        ]);
     }
 
     /** Lista com filtros. Devolve [linhas, total]. Respeita a visibilidade (quem não vê tudo só vê os seus). */

@@ -5,7 +5,6 @@ namespace GlpiPlugin\Escalations;
 use Closure;
 use RuntimeException;
 use Session;
-use Throwable;
 
 /**
  * Um escalonamento em andamento: nasce de um chamado, de um evento (webhook) ou da abertura manual, percorre os níveis
@@ -243,19 +242,13 @@ class Escalation extends Base
                 return [$id, false];
             }
         }
-        // Envio síncrono fica fora da trava de abertura. O início do N1 confere
-        // novamente o estado sob a mesma trava usada pelo ACK e pelo encerramento.
-        if (empty($in['no_start'])) {
-            Engine::startLevel($id);
-        }
         return [$id, true];
     }
 
     private static function findOrCreate(array $in, array $policy, string $key): array
     {
-        global $DB;
-        $DB->beginTransaction();
-        try {
+        return Transaction::run(static function () use ($in, $policy, $key): array {
+            global $DB;
             $duplicate = null;
             if ($key !== '') {
                 // Leitura atual mesmo se o chamador já abriu uma transação.
@@ -264,13 +257,8 @@ class Escalation extends Base
                 $query = $DB->doQuery("SELECT id FROM `$table` WHERE dedup_key = $quotedKey AND state IN ('open', 'acked') LIMIT 1 FOR UPDATE");
                 $duplicate = $DB->fetchRow($query);
             }
-            $result = $duplicate ? [(int) $duplicate[0], false] : [self::recordOpening($in, $policy, $key), true];
-            $DB->commit();
-            return $result;
-        } catch (Throwable $e) {
-            $DB->rollBack();
-            throw $e;
-        }
+            return $duplicate ? [(int) $duplicate[0], false] : [self::recordOpening($in, $policy, $key), true];
+        });
     }
 
     private static function groupOccurrence(?array $e, array $in): bool
@@ -325,6 +313,9 @@ class Escalation extends Base
         Log::write($esc, 'opened', ['status' => 'ok', 'message' => 'Escalonamento aberto (' . (self::SOURCES[$row['source']] ?? $row['source']) . ') na hierarquia "' . $policy['name'] . '".',
             'actor' => (string) ($in['actor'] ?? 'system'), 'detail' => ['source_ref' => $row['source_ref'], 'severity' => $row['severity'], 'rule' => $row['rules_id'],
                 'ack_due' => $row['ack_due_at'], 'resolve_due' => $row['resolve_due_at'], 'facts' => $in['facts'] ?? []]]);
+        if (empty($in['no_start'])) {
+            Engine::stageFirstLevel(self::get($id));
+        }
         return $id;
     }
 
@@ -333,7 +324,7 @@ class Escalation extends Base
     /** Reconhece (ACK): interrompe a cadeia. $via: glpi, popup, email, whatsapp, webhook. */
     public static function ack(int $id, int $uid, string $via = 'glpi', string $note = ''): void
     {
-        self::withLock($id, static fn (?array $e) => self::recordAck($e, $uid, $via, $note));
+        self::withLock($id, static fn (?array $e) => Transaction::run(static fn () => self::recordAck($e, $uid, $via, $note)));
     }
 
     private static function recordAck(?array $e, int $uid, string $via, string $note): void
@@ -354,17 +345,19 @@ class Escalation extends Base
         $DB->update(self::TABLE, ['state' => 'acked', 'acked_at' => $now, 'users_id_ack' => $uid, 'ack_via' => $via, 'next_action_at' => null,
             'ack_breached' => $breached, 'date_mod' => $now], ['id' => $id, 'state' => 'open']);
         self::requireTransition();
-        $DB->update(self::DELIVERIES, ['status' => 'acked', 'date_mod' => $now], ['escalations_id' => $id, 'channel' => 'popup', 'status' => ['queued', 'shown']]);
+        $DB->update(self::DELIVERIES, ['status' => 'acked', 'date_mod' => $now], [
+            'escalations_id' => $id, 'channel' => 'popup', 'kind' => 'level', 'role' => 'act', 'status' => ['queued', 'shown'],
+        ]);
         $tta = time() - strtotime((string) $e['opened_at']);
         Log::write($e, 'ack', ['status' => 'ok', 'users_id' => $uid, 'actor' => $via === 'whatsapp' ? 'whatsapp' : 'user', 'level' => (int) $e['level'],
             'message' => 'Reconhecido por ' . Ui::userName($uid) . ' (' . $via . ') em ' . Ui::dur($tta) . ($breached ? ' — fora do SLO de ACK' : ' — dentro do SLO de ACK') . '.',
             'detail' => ['via' => $via, 'time_to_ack_s' => $tta, 'slo_breached' => (bool) $breached, 'note' => $note]]);
-        Dispatcher::announce(self::get($id), 'Reconhecido por ' . Ui::userName($uid) . ' em ' . Ui::dur($tta) . '. A escalada foi interrompida.');
+        Dispatcher::stageAnnouncement($e, 'announce:ack');
     }
 
     public static function resolve(int $id, string $by = 'user', int $uid = 0, string $note = ''): void
     {
-        self::withLock($id, static fn (?array $e) => self::recordResolution($e, $by, $uid, $note));
+        self::withLock($id, static fn (?array $e) => Transaction::run(static fn () => self::recordResolution($e, $by, $uid, $note)));
     }
 
     private static function recordResolution(?array $e, string $by, int $uid, string $note): void
@@ -384,12 +377,12 @@ class Escalation extends Base
         Log::write($e, 'resolved', ['status' => 'ok', 'users_id' => $uid, 'actor' => $uid ? 'user' : 'system', 'level' => (int) $e['level'],
             'message' => 'Resolvido (' . $by . ') após ' . Ui::dur($total) . ($breached ? ' — fora do SLO de resolução' : ' — dentro do SLO de resolução') . '.',
             'detail' => ['by' => $by, 'duration_s' => $total, 'slo_breached' => (bool) $breached, 'note' => $note]]);
-        Dispatcher::announce(self::get($id), 'Resolvido após ' . Ui::dur($total) . '.');
+        Dispatcher::stageAnnouncement($e, 'announce:resolve');
     }
 
     public static function cancel(int $id, string $why, int $uid = 0): void
     {
-        self::withLock($id, static fn (?array $e) => self::recordCancellation($e, $why, $uid));
+        self::withLock($id, static fn (?array $e) => Transaction::run(static fn () => self::recordCancellation($e, $why, $uid)));
     }
 
     private static function recordCancellation(?array $e, string $why, int $uid): void

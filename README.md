@@ -26,6 +26,14 @@ Chave/pasta: `escalations` · namespace `GlpiPlugin\Escalations` · tabelas `glp
 | SLA | Lê o prazo de solução (SLA) nativo dos chamados: cumprido, estourado, abertos em risco, estouros por entidade. |
 | Saúde do motor | Banner vermelho em todas as telas se o cron não roda há mais de 3 min. |
 
+## Recuperação de entregas
+
+O nível, o marco de SLO e as respectivas entregas são gravados juntos. O motor processa pendências confirmadas no banco, inclusive as de chamadas à API. A ficha, o pop-up de ACK e a abertura por webhook também tentam processar a fila da ocorrência logo após a gravação.
+
+Falhas retornadas pelo canal mantêm as tentativas e o canal reserva configurados. Uma tentativa interrompida durante o envio fica **sem confirmação** na ficha. Como o provedor pode tê-la aceitado, o motor não repete essa tentativa nem aciona o canal reserva automaticamente. O mesmo vale para entradas antigas em fila cujo estado não permite saber se o transporte já foi chamado.
+
+Antes de cada tentativa, o motor confere se o aviso ainda é pertinente. O ACK encerra pedidos de ação pendentes e preserva avisos informativos válidos, como o SLO de resolução. Após o encerramento da ocorrência, os avisos de prazo ainda em curso são dispensados. Estouro de SLO já registrado continua sendo um fato que pode ser comunicado pelos canais externos.
+
 ## Para outros plugins (API)
 
 Qualquer plugin, atual ou futuro, escala itens com prazo sem conhecer hierarquias (`src/Api.php`; nunca lança exceção):
